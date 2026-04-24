@@ -15,6 +15,7 @@ import android.view.WindowInsetsController
 import android.view.WindowManager
 import android.widget.FrameLayout
 import android.widget.ImageButton
+import android.widget.TextView
 import androidx.activity.OnBackPressedCallback
 import androidx.annotation.OptIn
 import androidx.core.view.isVisible
@@ -108,7 +109,8 @@ class FullscreenVideoFragment(private val videoView: VideoView) : Fragment() {
       videoView.playerView.useController = false
       videoView.playerView.controllerAutoShow = false
     } else {
-      videoView.playerView.useController = videoView.useController
+      // In fullscreen, we always want controls enabled
+      videoView.playerView.useController = true
       videoView.playerView.controllerAutoShow = true
     }
   }
@@ -122,7 +124,8 @@ class FullscreenVideoFragment(private val videoView: VideoView) : Fragment() {
       videoView.playerView.useController = false
       videoView.playerView.controllerAutoShow = false
     } else {
-      videoView.playerView.useController = videoView.useController
+      // In fullscreen, we always want controls enabled
+      videoView.playerView.useController = true
       videoView.playerView.controllerAutoShow = true
     }
   }
@@ -178,6 +181,31 @@ class FullscreenVideoFragment(private val videoView: VideoView) : Fragment() {
 
     // Add close button after player view so it's on top
     setupCloseButton()
+
+    // Add playback speed button logic
+    setupPlaybackSpeedButton()
+
+    // Show controller initially
+    videoView.playerView.showController()
+  }
+
+  private fun setupPlaybackSpeedButton() {
+    val speedButton = videoView.playerView.findViewById<TextView>(com.unifiedplayer.R.id.exo_playback_speed)
+    
+    speedButton?.setOnClickListener {
+      val player = videoView.playerView.player ?: return@setOnClickListener
+      val currentSpeed = player.playbackParameters.speed
+      
+      val nextSpeed = when (currentSpeed) {
+        1.0f -> 2.0f
+        2.0f -> 4.0f
+        4.0f -> 1.0f
+        else -> 1.0f
+      }
+      
+      player.setPlaybackSpeed(nextSpeed)
+      speedButton.text = "${nextSpeed}x"
+    }
   }
 
   private fun setupCloseButton() {
@@ -261,12 +289,13 @@ class FullscreenVideoFragment(private val videoView: VideoView) : Fragment() {
     }
     originalOrientation = null
 
-    // Keep controls disabled if in PiP mode - media session creates its own controls for PiP
-    val isInPictureInPictureMode = requireActivity().isInPictureInPictureMode
-    if (isInPictureInPictureMode) {
-      videoView.playerView.useController = false
-    } else if (videoView.useController == false) {
-      videoView.playerView.useController = false
+    // Restore controller state from VideoView settings
+    videoView.playerView.useController = videoView.useController
+    if (videoView.useController) {
+      videoView.playerView.controllerAutoShow = true
+    } else {
+      videoView.playerView.hideController()
+      videoView.playerView.controllerAutoShow = false
     }
 
     // Ensure PlayerView keeps black background when returning to normal mode
