@@ -14,16 +14,34 @@
   "ignorePaths": ["drm-plugin", "node_modules"],
   "autolinking": {
     "VideoPlayerFactory": {
-      "swift": "HybridVideoPlayerFactory",
-      "kotlin": "HybridVideoPlayerFactory"
+      "ios": {
+        "language": "swift",
+        "implementationClassName": "HybridVideoPlayerFactory"
+      },
+      "android": {
+        "language": "kotlin",
+        "implementationClassName": "HybridVideoPlayerFactory"
+      }
     },
     "VideoPlayerSourceFactory": {
-      "swift": "HybridVideoPlayerSourceFactory",
-      "kotlin": "HybridVideoPlayerSourceFactory"
+      "ios": {
+        "language": "swift",
+        "implementationClassName": "HybridVideoPlayerSourceFactory"
+      },
+      "android": {
+        "language": "kotlin",
+        "implementationClassName": "HybridVideoPlayerSourceFactory"
+      }
     },
     "VideoViewViewManagerFactory": {
-      "swift": "HybridVideoViewViewManagerFactory",
-      "kotlin": "HybridVideoViewViewManagerFactory"
+      "ios": {
+        "language": "swift",
+        "implementationClassName": "HybridVideoViewViewManagerFactory"
+      },
+      "android": {
+        "language": "kotlin",
+        "implementationClassName": "HybridVideoViewViewManagerFactory"
+      }
     }
   }
 }
