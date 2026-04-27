@@ -189,10 +189,8 @@ const VideoView = React.forwardRef<VideoViewRef, VideoViewProps>(
 
     const setupViewManager = React.useCallback(
       (id: number) => {
-        console.log('[UnifiedPlayer] setupViewManager called with id:', id);
         try {
           if (nitroViewManager.current === null) {
-            console.log('[UnifiedPlayer] Creating view manager...');
             nitroViewManager.current =
               VideoViewViewManagerFactory.createViewManager(id);
 
@@ -205,10 +203,8 @@ const VideoView = React.forwardRef<VideoViewRef, VideoViewProps>(
             }
           }
 
-          console.log('[UnifiedPlayer] View manager created successfully');
           setIsManagerReady(true);
         } catch (error) {
-          console.log('[UnifiedPlayer] Error creating view manager:', error);
           const parsedError = tryParseNativeVideoError(error);
 
           if (
@@ -241,10 +237,6 @@ const VideoView = React.forwardRef<VideoViewRef, VideoViewProps>(
 
     const onNitroIdChange = React.useCallback(
       (event: { nativeEvent: { nitroId: number } }) => {
-        console.log(
-          '[UnifiedPlayer] onNitroIdChange received:',
-          event.nativeEvent
-        );
         setupViewManager(event.nativeEvent.nitroId);
       },
       [setupViewManager]
@@ -454,9 +446,20 @@ const VideoView = React.forwardRef<VideoViewRef, VideoViewProps>(
       }
     }, [isManagerReady, autoplay, player, paused]);
 
-    // Handle fullscreen prop changes
+    // Handle fullscreen prop changes — only act on real transitions.
+    // Initial mount must not call exit/enterFullscreen: the underlying
+    // native view may already be deallocated in recycler scenarios
+    // (e.g. FlatList/FlashList items mounted/unmounted rapidly).
+    const prevFullscreenRef = React.useRef<boolean | undefined>(undefined);
     React.useEffect(() => {
       if (!nitroViewManager.current || !isManagerReady) {
+        return;
+      }
+
+      const prev = prevFullscreenRef.current;
+      prevFullscreenRef.current = fullscreen;
+
+      if (prev === undefined || prev === fullscreen) {
         return;
       }
 
@@ -467,8 +470,6 @@ const VideoView = React.forwardRef<VideoViewRef, VideoViewProps>(
           nitroViewManager.current.exitFullscreen();
         }
       } catch (error) {
-        // Ignore errors when entering/exiting fullscreen
-        // This can happen if the view is not ready yet
         console.warn(
           '[UnifiedPlayer] Failed to change fullscreen state:',
           error
