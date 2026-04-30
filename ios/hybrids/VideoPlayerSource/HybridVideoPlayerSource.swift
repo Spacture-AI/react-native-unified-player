@@ -19,6 +19,11 @@ class HybridVideoPlayerSource: HybridVideoPlayerSourceSpec, NativeVideoPlayerSou
   let url: URL
   private let sourceLoader = SourceLoader()
 
+  // Strong ref to the resource loader delegate so AVPlayer can keep
+  // calling it while the asset is alive (AVFoundation only retains the
+  // delegate weakly).
+  private var headerLoaderDelegate: AuthHeaderAssetResourceLoader?
+
   init(config: NativeVideoConfig) throws {
     self.uri = config.uri
     self.config = config
@@ -85,11 +90,25 @@ class HybridVideoPlayerSource: HybridVideoPlayerSourceSpec, NativeVideoPlayerSou
       return
     }
 
-    if let headers = config.headers {
-      let options = [
-        "AVURLAssetHTTPHeaderFieldsKey": headers
-      ]
-      asset = AVURLAsset(url: url, options: options)
+    // `AVURLAssetHTTPHeaderFieldsKey` is documented to apply only to the
+    // top-level master playlist request and does NOT propagate to HLS
+    // sub-resource requests (TS / fMP4 segments, key requests). When
+    // headers are supplied we route every load through
+    // `AuthHeaderAssetResourceLoader` instead — that delegate intercepts
+    // each sub-request, restores the real https:// URL, attaches the
+    // headers, and runs the request via URLSession.
+    if let headers = config.headers, !headers.isEmpty {
+      let prefixedURLString = url.absoluteString.replacingOccurrences(
+        of: "https://", with: "\(AuthHeaderAssetResourceLoader.customScheme)://"
+      )
+      guard let prefixedURL = URL(string: prefixedURLString) else {
+        throw SourceError.invalidUri(uri: uri).error()
+      }
+      let loader = AuthHeaderAssetResourceLoader(headers: headers)
+      let newAsset = AVURLAsset(url: prefixedURL)
+      newAsset.resourceLoader.setDelegate(loader, queue: loader.queue)
+      headerLoaderDelegate = loader
+      asset = newAsset
     } else {
       asset = AVURLAsset(url: url)
     }
@@ -154,6 +173,7 @@ class HybridVideoPlayerSource: HybridVideoPlayerSourceSpec, NativeVideoPlayerSou
   func releaseAsset() {
     sourceLoader.cancelSync()
     asset = nil
+    headerLoaderDelegate = nil
   }
 
   var memorySize: Int {
