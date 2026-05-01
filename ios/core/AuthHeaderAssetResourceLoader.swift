@@ -21,16 +21,28 @@ import Foundation
 ///   • Every loading request that arrives with our scheme is unwrapped
 ///     back to `https://`, executed via URLSession with the header set,
 ///     and streamed back to the requesting AVAssetResourceLoadingRequest.
+///
+/// Concurrency notes:
+///   • The delegate `queue` we hand to AVFoundation is only used to call
+///     INTO our `shouldWaitForLoadingOfRequestedResource` /
+///     `didCancel` methods. Our completion handlers (respond + finishLoading)
+///     intentionally run on URLSession's own queues so AVPlayer's parallel
+///     segment fetches don't serialize on a single queue — that bottleneck
+///     causes mid-playback stutter and laggy scrub.
+///   • `pendingTasks` is the only mutable shared state; guarded by NSLock.
+///   • `deinit` invalidates the URLSession so any in-flight tasks abort
+///     immediately when the asset is released (e.g. camera switch). Without
+///     this, the old player's segment fetches keep running and starve the
+///     new player.
 @objc public class AuthHeaderAssetResourceLoader: NSObject {
   /// Custom URL scheme used to opt AVPlayer out of native loading and
-  /// route requests through this delegate. Picked to be unique enough to
-  /// not collide with any RFC scheme or other delegate (`HLSSubtitleInjector`
-  /// uses `rnv-hls`).
+  /// route requests through this delegate.
   @objc public static let customScheme = "uphls-auth"
 
-  /// Serial queue AVFoundation will invoke our delegate methods on. Keeping
-  /// it `userInitiated` matches the existing `HLSSubtitleInjector`
-  /// convention and avoids stalling playback on background threads.
+  /// Delegate-method dispatch queue. AVFoundation calls
+  /// `shouldWaitForLoadingOfRequestedResource` and `didCancel` on this
+  /// queue. Kept serial + `userInitiated`; work is offloaded to URLSession
+  /// immediately so the queue never becomes the bottleneck.
   @objc public let queue = DispatchQueue(
     label: "com.unifiedplayer.AuthHeaderAssetResourceLoader",
     qos: .userInitiated
@@ -38,10 +50,7 @@ import Foundation
 
   private let headers: [String: String]
   private let session: URLSession
-
-  /// AVPlayer can issue many concurrent sub-requests. Each one gets its
-  /// own URLSessionDataTask; we track them by the loadingRequest so we
-  /// can cancel cleanly when AVPlayer cancels (seek / asset teardown).
+  private let pendingLock = NSLock()
   private var pendingTasks: [ObjectIdentifier: URLSessionDataTask] = [:]
 
   @objc public init(headers: [String: String]) {
@@ -50,10 +59,25 @@ import Foundation
     let config = URLSessionConfiguration.default
     config.timeoutIntervalForRequest = 30
     config.timeoutIntervalForResource = 120
+    // Disable URLCache: HLS segments are large, mostly play-once, and
+    // AVFoundation has its own buffering. Caching them in URLCache
+    // doubles memory pressure and trips eviction storms during seek.
+    config.urlCache = nil
     config.requestCachePolicy = .reloadIgnoringLocalCacheData
+    // Default is 4 — bumping to 10 gives AVPlayer headroom to parallel-
+    // fetch the first few segments after seek without queueing.
+    config.httpMaximumConnectionsPerHost = 10
+
     self.session = URLSession(configuration: config)
 
     super.init()
+  }
+
+  deinit {
+    // Tear down all in-flight network tasks belonging to this asset.
+    // Critical when the user switches cameras: the old delegate must
+    // stop fighting the new player for sockets / bandwidth.
+    session.invalidateAndCancel()
   }
 
   /// Convert an `https://...` URL into `uphls-auth://...` so AVURLAsset
@@ -75,6 +99,19 @@ import Foundation
     }
     components.scheme = "https"
     return components.url
+  }
+
+  private func storeTask(_ task: URLSessionDataTask, for key: ObjectIdentifier) {
+    pendingLock.lock()
+    pendingTasks[key] = task
+    pendingLock.unlock()
+  }
+
+  private func popTask(for key: ObjectIdentifier) -> URLSessionDataTask? {
+    pendingLock.lock()
+    let task = pendingTasks.removeValue(forKey: key)
+    pendingLock.unlock()
+    return task
   }
 
   private func failWithStatus(
@@ -125,70 +162,68 @@ extension AuthHeaderAssetResourceLoader: AVAssetResourceLoaderDelegate {
 
     let key = ObjectIdentifier(loadingRequest)
 
+    // Completion handler runs on URLSession's default delegate queue
+    // (concurrent), NOT on `self.queue`. AVAssetResourceLoadingRequest's
+    // `respond(with:)` and `finishLoading()` are documented thread-safe,
+    // so we call them directly here. This keeps parallel segment fetches
+    // from serializing on the delegate queue.
     let task = session.dataTask(with: request) { [weak self] data, response, error in
       guard let self = self else {
         loadingRequest.finishLoading(with: error)
         return
       }
-      self.queue.async {
-        self.pendingTasks.removeValue(forKey: key)
+      _ = self.popTask(for: key)
 
-        if let error = error as NSError?, error.code == NSURLErrorCancelled {
-          // Request cancelled (likely AVPlayer moved on) — don't surface.
-          return
-        }
-        if let error = error {
-          loadingRequest.finishLoading(with: error)
-          return
-        }
-        guard let httpResponse = response as? HTTPURLResponse else {
-          self.failWithStatus(loadingRequest, -1)
-          return
-        }
-        // Treat any non-2xx as a failure so AVPlayer surfaces an
-        // `onError` event rather than silently buffering forever.
-        // 206 (partial content) is allowed for range requests.
-        guard 200...299 ~= httpResponse.statusCode else {
-          self.failWithStatus(loadingRequest, httpResponse.statusCode)
-          return
-        }
-
-        if let contentRequest = loadingRequest.contentInformationRequest {
-          contentRequest.contentType =
-            httpResponse.value(forHTTPHeaderField: "Content-Type")
-            ?? "application/octet-stream"
-
-          // Prefer Content-Range's total-length when the server returned
-          // a 206; otherwise use Content-Length / expectedContentLength.
-          if let contentRangeHeader = httpResponse.value(forHTTPHeaderField: "Content-Range"),
-            let totalSlice = contentRangeHeader.split(separator: "/").last,
-            let totalLength = Int64(totalSlice)
-          {
-            contentRequest.contentLength = totalLength
-          } else if httpResponse.expectedContentLength > 0 {
-            contentRequest.contentLength = httpResponse.expectedContentLength
-          } else if let data = data {
-            contentRequest.contentLength = Int64(data.count)
-          }
-
-          // Honor Accept-Ranges so AVPlayer knows whether seeking inside
-          // a resource via byte ranges is safe.
-          let acceptRanges =
-            httpResponse.value(forHTTPHeaderField: "Accept-Ranges")?.lowercased() ?? ""
-          contentRequest.isByteRangeAccessSupported = acceptRanges.contains("bytes")
-        }
-
-        if let dataRequest = loadingRequest.dataRequest, let data = data {
-          dataRequest.respond(with: data)
-        }
-
-        loadingRequest.finishLoading()
+      if let error = error as NSError?, error.code == NSURLErrorCancelled {
+        // Request cancelled (likely AVPlayer moved on or asset released).
+        return
       }
+      if let error = error {
+        loadingRequest.finishLoading(with: error)
+        return
+      }
+      guard let httpResponse = response as? HTTPURLResponse else {
+        self.failWithStatus(loadingRequest, -1)
+        return
+      }
+      // Non-2xx → surface as `onError` instead of silent buffering.
+      // 206 (partial content) is allowed for range requests.
+      guard 200...299 ~= httpResponse.statusCode else {
+        self.failWithStatus(loadingRequest, httpResponse.statusCode)
+        return
+      }
+
+      if let contentRequest = loadingRequest.contentInformationRequest {
+        contentRequest.contentType =
+          httpResponse.value(forHTTPHeaderField: "Content-Type")
+          ?? "application/octet-stream"
+
+        // Prefer Content-Range's total-length when the server returned
+        // a 206; otherwise use Content-Length / expectedContentLength.
+        if let contentRangeHeader = httpResponse.value(forHTTPHeaderField: "Content-Range"),
+          let totalSlice = contentRangeHeader.split(separator: "/").last,
+          let totalLength = Int64(totalSlice)
+        {
+          contentRequest.contentLength = totalLength
+        } else if httpResponse.expectedContentLength > 0 {
+          contentRequest.contentLength = httpResponse.expectedContentLength
+        } else if let data = data {
+          contentRequest.contentLength = Int64(data.count)
+        }
+
+        let acceptRanges =
+          httpResponse.value(forHTTPHeaderField: "Accept-Ranges")?.lowercased() ?? ""
+        contentRequest.isByteRangeAccessSupported = acceptRanges.contains("bytes")
+      }
+
+      if let dataRequest = loadingRequest.dataRequest, let data = data {
+        dataRequest.respond(with: data)
+      }
+
+      loadingRequest.finishLoading()
     }
 
-    queue.async {
-      self.pendingTasks[key] = task
-    }
+    storeTask(task, for: key)
     task.resume()
     return true
   }
@@ -198,8 +233,7 @@ extension AuthHeaderAssetResourceLoader: AVAssetResourceLoaderDelegate {
     didCancel loadingRequest: AVAssetResourceLoadingRequest
   ) {
     let key = ObjectIdentifier(loadingRequest)
-    queue.async { [weak self] in
-      guard let task = self?.pendingTasks.removeValue(forKey: key) else { return }
+    if let task = popTask(for: key) {
       task.cancel()
     }
   }
