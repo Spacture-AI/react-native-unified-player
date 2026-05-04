@@ -34,16 +34,25 @@ import Foundation
 ///     immediately when the asset is released (e.g. camera switch). Without
 ///     this, the old player's segment fetches keep running and starve the
 ///     new player.
-@objc public class AuthHeaderAssetResourceLoader: NSObject, AVAssetResourceLoaderDelegate {
+// NOTE: Intentionally `internal` (no `public`) and not `@objc`. Public
+// NSObject subclasses are auto-exported into `UnifiedPlayer-Swift.h`, which
+// would force a `<AVAssetResourceLoaderDelegate>` declaration. The Nitro
+// C++ umbrella (`UnifiedPlayer-Swift-Cxx-Umbrella.hpp`) `#include`s that
+// header from C++/ObjC++ contexts where clang modules are off, so the
+// `@import AVFoundation;` line is gated out and the protocol can't resolve.
+// Keeping the class module-internal removes it from the header entirely.
+// Only Swift code in this module references it (HybridVideoPlayerSource);
+// AVFoundation discovers the delegate methods via the Obj-C runtime.
+final class AuthHeaderAssetResourceLoader: NSObject, AVAssetResourceLoaderDelegate {
   /// Custom URL scheme used to opt AVPlayer out of native loading and
   /// route requests through this delegate.
-  @objc public static let customScheme = "uphls-auth"
+  static let customScheme = "uphls-auth"
 
   /// Delegate-method dispatch queue. AVFoundation calls
   /// `shouldWaitForLoadingOfRequestedResource` and `didCancel` on this
   /// queue. Kept serial + `userInitiated`; work is offloaded to URLSession
   /// immediately so the queue never becomes the bottleneck.
-  @objc public let queue = DispatchQueue(
+  let queue = DispatchQueue(
     label: "com.unifiedplayer.AuthHeaderAssetResourceLoader",
     qos: .userInitiated
   )
@@ -53,7 +62,7 @@ import Foundation
   private let pendingLock = NSLock()
   private var pendingTasks: [ObjectIdentifier: URLSessionDataTask] = [:]
 
-  @objc public init(headers: [String: String]) {
+  init(headers: [String: String]) {
     self.headers = headers
 
     let config = URLSessionConfiguration.default
@@ -83,7 +92,7 @@ import Foundation
   /// Convert an `https://...` URL into `uphls-auth://...` so AVURLAsset
   /// hands every request to this delegate instead of resolving them with
   /// its built-in HTTP loader.
-  @objc public static func obfuscate(_ url: URL) -> URL? {
+  static func obfuscate(_ url: URL) -> URL? {
     guard var components = URLComponents(url: url, resolvingAgainstBaseURL: false) else {
       return nil
     }
@@ -130,7 +139,7 @@ import Foundation
 // MARK: - AVAssetResourceLoaderDelegate
 
 extension AuthHeaderAssetResourceLoader {
-  public func resourceLoader(
+  func resourceLoader(
     _ resourceLoader: AVAssetResourceLoader,
     shouldWaitForLoadingOfRequestedResource loadingRequest: AVAssetResourceLoadingRequest
   ) -> Bool {
@@ -228,7 +237,7 @@ extension AuthHeaderAssetResourceLoader {
     return true
   }
 
-  public func resourceLoader(
+  func resourceLoader(
     _ resourceLoader: AVAssetResourceLoader,
     didCancel loadingRequest: AVAssetResourceLoadingRequest
   ) {
