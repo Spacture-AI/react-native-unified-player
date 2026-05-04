@@ -19,11 +19,6 @@ class HybridVideoPlayerSource: HybridVideoPlayerSourceSpec, NativeVideoPlayerSou
   let url: URL
   private let sourceLoader = SourceLoader()
 
-  // Strong ref to the resource loader delegate so AVPlayer can keep
-  // calling it while the asset is alive (AVFoundation only retains the
-  // delegate weakly).
-  private var headerLoaderDelegate: AuthHeaderAssetResourceLoader?
-
   init(config: NativeVideoConfig) throws {
     self.uri = config.uri
     self.config = config
@@ -90,25 +85,26 @@ class HybridVideoPlayerSource: HybridVideoPlayerSourceSpec, NativeVideoPlayerSou
       return
     }
 
-    // `AVURLAssetHTTPHeaderFieldsKey` is documented to apply only to the
-    // top-level master playlist request and does NOT propagate to HLS
-    // sub-resource requests (TS / fMP4 segments, key requests). When
-    // headers are supplied we route every load through
-    // `AuthHeaderAssetResourceLoader` instead — that delegate intercepts
-    // each sub-request, restores the real https:// URL, attaches the
-    // headers, and runs the request via URLSession.
+    // Pass headers via `AVURLAssetHTTPHeaderFieldsKey` — the v1.0.18
+    // path that's been working in production. The documented caveat is
+    // that this key only applies to the master playlist request, not
+    // sub-resource fetches (segments / keys). The Spacture proxy doesn't
+    // require bearer auth on segment endpoints (`/recordings/...`), so
+    // master-playlist auth is sufficient.
+    //
+    // The v1.0.19+ `AuthHeaderAssetResourceLoader` route was added to
+    // propagate headers to every sub-request via a custom URL scheme —
+    // but iOS 17's HLS-FASB / FigPlayerInterstitial pipeline doesn't
+    // trust data delivered through a custom-scheme resource loader and
+    // bails with -15514 / -12753 / -15671 before any segment fetch.
+    // hls.js (web) doesn't share this strictness, which is why the same
+    // playlist plays in the webapp. If a future deployment ever needs
+    // segment auth, prefer a localhost reverse-proxy approach over the
+    // resource-loader trick — AVPlayer's native HLS pipeline is not
+    // forgiving about being intercepted at the URL-loader layer.
     if let headers = config.headers, !headers.isEmpty {
-      let prefixedURLString = url.absoluteString.replacingOccurrences(
-        of: "https://", with: "\(AuthHeaderAssetResourceLoader.customScheme)://"
-      )
-      guard let prefixedURL = URL(string: prefixedURLString) else {
-        throw SourceError.invalidUri(uri: uri).error()
-      }
-      let loader = AuthHeaderAssetResourceLoader(headers: headers)
-      let newAsset = AVURLAsset(url: prefixedURL)
-      newAsset.resourceLoader.setDelegate(loader, queue: loader.queue)
-      headerLoaderDelegate = loader
-      asset = newAsset
+      let options = ["AVURLAssetHTTPHeaderFieldsKey": headers]
+      asset = AVURLAsset(url: url, options: options)
     } else {
       asset = AVURLAsset(url: url)
     }
@@ -173,7 +169,6 @@ class HybridVideoPlayerSource: HybridVideoPlayerSourceSpec, NativeVideoPlayerSou
   func releaseAsset() {
     sourceLoader.cancelSync()
     asset = nil
-    headerLoaderDelegate = nil
   }
 
   var memorySize: Int {
