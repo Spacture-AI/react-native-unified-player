@@ -34,7 +34,7 @@ import Foundation
 ///     immediately when the asset is released (e.g. camera switch). Without
 ///     this, the old player's segment fetches keep running and starve the
 ///     new player.
-@objc public class AuthHeaderAssetResourceLoader: NSObject {
+@objc public class AuthHeaderAssetResourceLoader: NSObject, AVAssetResourceLoaderDelegate {
   /// Custom URL scheme used to opt AVPlayer out of native loading and
   /// route requests through this delegate.
   @objc public static let customScheme = "uphls-auth"
@@ -129,7 +129,7 @@ import Foundation
 
 // MARK: - AVAssetResourceLoaderDelegate
 
-extension AuthHeaderAssetResourceLoader: AVAssetResourceLoaderDelegate {
+extension AuthHeaderAssetResourceLoader {
   public func resourceLoader(
     _ resourceLoader: AVAssetResourceLoader,
     shouldWaitForLoadingOfRequestedResource loadingRequest: AVAssetResourceLoadingRequest
