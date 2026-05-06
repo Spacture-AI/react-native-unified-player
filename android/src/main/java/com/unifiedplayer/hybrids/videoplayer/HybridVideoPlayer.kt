@@ -20,6 +20,8 @@ import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.analytics.AnalyticsListener
+import androidx.media3.exoplayer.mediacodec.MediaCodecSelector
+import androidx.media3.exoplayer.trackselection.DefaultTrackSelector
 import androidx.media3.exoplayer.upstream.DefaultAllocator
 import androidx.media3.extractor.metadata.emsg.EventMessage
 import androidx.media3.extractor.metadata.id3.Id3Frame
@@ -246,15 +248,44 @@ class HybridVideoPlayer() : HybridVideoPlayerSpec(), AutoCloseable {
       )
       .build()
 
+    // Renderers:
+    //   setEnableDecoderFallback(true) — if the primary HW decoder rejects an HEVC
+    //     sample (Main10, profile/level mismatch, vendor bug), ExoPlayer transparently
+    //     falls back to a secondary decoder (e.g. software c2.android.hevc.decoder).
+    //   setMediaCodecSelector(DEFAULT) — explicit so the selector enumerates *all*
+    //     HEVC decoders the device exposes, not just the first match. Some Mediatek
+    //     SoCs list a buggy HEVC HW decoder before the working one.
+    //   forceEnableMediaCodecAsynchronousQueueing() — kept; improves H.264 latency
+    //     and the decoder-fallback path will catch any device where async queueing
+    //     interacts badly with HEVC.
     val renderersFactory = DefaultRenderersFactory(context)
       .forceEnableMediaCodecAsynchronousQueueing()
       .setEnableDecoderFallback(true)
+      .setMediaCodecSelector(MediaCodecSelector.DEFAULT)
 
-    // Build the player with the LoadControl
+    // Track selector tuned for adaptive HLS that mixes H.264 and H.265 variants.
+    //   setAllowVideoMixedMimeTypeAdaptiveness — required to switch between H.264
+    //     and H.265 variants in the same EXT-X-STREAM-INF group. Off-by-default
+    //     conservatively, but server-side HEVC ladders often expose mixed MIME.
+    //   setAllowVideoNonSeamlessAdaptiveness — lets the player rebuild the codec
+    //     when crossing a HEVC variant boundary instead of failing track selection.
+    //   setExceedVideoConstraintsIfNecessary — falls back to picking the lowest
+    //     HEVC rendition rather than failing if every HEVC track exceeds the
+    //     default 1080p/30fps viewport constraint on small surfaces.
+    val trackSelector = DefaultTrackSelector(context).apply {
+      setParameters(
+        buildUponParameters()
+          .setAllowVideoMixedMimeTypeAdaptiveness(true)
+          .setAllowVideoNonSeamlessAdaptiveness(true)
+          .setExceedVideoConstraintsIfNecessary(true)
+      )
+    }
+
     player = ExoPlayer.Builder(context)
       .setLoadControl(loadControl)
       .setLooper(Looper.getMainLooper())
       .setRenderersFactory(renderersFactory)
+      .setTrackSelector(trackSelector)
       .build()
 
     loadedWithSource = true

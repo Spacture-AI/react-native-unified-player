@@ -12,9 +12,11 @@ import androidx.media3.common.MediaItem
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.dash.DashMediaSource
 import androidx.media3.exoplayer.drm.DrmSessionManager
+import androidx.media3.exoplayer.hls.DefaultHlsExtractorFactory
 import androidx.media3.exoplayer.hls.HlsMediaSource
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.exoplayer.source.MergingMediaSource
+import androidx.media3.extractor.ts.DefaultTsPayloadReaderFactory
 import com.margelo.nitro.unifiedplayer.HybridVideoPlayerSource
 import com.unifiedplayer.core.LibraryError
 import com.unifiedplayer.core.SourceError
@@ -43,7 +45,27 @@ fun buildMediaSource(context: Context, source: HybridVideoPlayerSource, mediaIte
       DashMediaSource.Factory(dataSourceFactory)
     }
     C.CONTENT_TYPE_HLS -> {
+      // HEVC-friendly HLS extractor:
+      //   FLAG_ALLOW_NON_IDR_KEYFRAMES — H.265 uses CRA/BLA/IDR_N_LP NAL units instead
+      //     of H.264 IDR. Without this flag the TS payload reader can drop the first
+      //     keyframe in HEVC HLS streams, producing audio-only / black-video playback.
+      //   FLAG_DETECT_ACCESS_UNITS — required when the stream lacks AUD NAL units
+      //     between samples, also common in HEVC TS HLS.
+      // Chunkless preparation is DISABLED: the Spacture proxy serves a media-only
+      // playlist (no master with `CODECS="hvc1.*"`), so chunkless prep can't infer
+      // the track format and the renderer initialises against the wrong codec —
+      // black video, looping rebuffer. Forcing first-segment download lets the TS
+      // extractor probe the bitstream and surface HEVC correctly. The one-extra
+      // segment fetch on startup is well worth restoring playback.
       HlsMediaSource.Factory(dataSourceFactory)
+        .setExtractorFactory(
+          DefaultHlsExtractorFactory(
+            DefaultTsPayloadReaderFactory.FLAG_ALLOW_NON_IDR_KEYFRAMES or
+              DefaultTsPayloadReaderFactory.FLAG_DETECT_ACCESS_UNITS,
+            true
+          )
+        )
+        .setAllowChunklessPreparation(false)
     }
     C.CONTENT_TYPE_OTHER -> {
       DefaultMediaSourceFactory(context)

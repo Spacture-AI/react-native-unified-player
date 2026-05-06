@@ -130,7 +130,13 @@ class HybridVideoPlayerSource: HybridVideoPlayerSourceSpec, NativeVideoPlayerSou
 
       // Code browned from expo-video https://github.com/expo/expo/blob/ea17c9b1ce5111e1454b089ba381f3feb93f33cc/packages/expo-video/ios/VideoPlayerItem.swift#L40C30-L40C73
       // If we don't load those properties, they will be loaded on main thread causing lags
-      _ = try? await asset.load(.duration, .preferredTransform, .isPlayable) as Any
+      //
+      // `.tracks` is required for HEVC HLS: AVAssetTrack.formatDescriptions carries the
+      // HEVC `hvcC` atom (VPS/SPS/PPS). If the AVPlayer attaches to the display layer
+      // before format descriptions resolve, the HEVC decoder spins up without parameter
+      // sets and renders black frames while audio plays normally. Loading async here
+      // forces format discovery off the main thread and before first paint.
+      _ = try? await asset.load(.duration, .preferredTransform, .isPlayable, .tracks) as Any
 
       try Task.checkCancellation()
     } catch {
