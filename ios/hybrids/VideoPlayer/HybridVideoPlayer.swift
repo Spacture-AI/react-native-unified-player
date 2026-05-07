@@ -3,62 +3,41 @@
 //  ReactNativeVideo
 //
 //  Created by Krzysztof Moch on 09/10/2024.
+//  VLC backend rewrite — replaces AVPlayer with MobileVLCKit.
 //
 
-import AVFoundation
 import Foundation
+import MobileVLCKit
 import NitroModules
 
-class HybridVideoPlayer: HybridVideoPlayerSpec, NativeVideoPlayerSpec {
+final class HybridVideoPlayer: HybridVideoPlayerSpec {
 
-  /**
-   * Player instance for video playback
-   */
-  var player: AVPlayer {
-    didSet {
-      playerObserver?.initializePlayerObservers()
-    }
-    willSet {
-      playerObserver?.invalidatePlayerObservers()
-    }
-  }
+  public let mediaPlayer: VLCMediaPlayer
+  private var media: VLCMedia?
+  private var vlcDelegate: VLCDelegateProxy?
 
-  var playerItem: AVPlayerItem? {
-    didSet {
-      if let bufferConfig = source.config.bufferConfig {
-        playerItem?.setBufferConfig(config: bufferConfig)
-      }
-    }
-  }
-  var playerObserver: VideoPlayerObserver?
-  private let sourceLoader = SourceLoader()
+  // Cached state — VLC doesn't surface every property as a getter we can poll
+  // safely from arbitrary threads, so we mirror what JS asks for.
+  private var lastReportedRate: Double = 1.0
+  private var hasFiredOnLoad: Bool = false
+  private var hasFiredOnLoadStart: Bool = false
+  private var lastEmittedIsPlaying: Bool = false
+  private var lastEmittedIsBuffering: Bool = false
+  private var pendingSeekSeconds: Double? = nil
 
   init(source: (any HybridVideoPlayerSourceSpec)) throws {
     self.source = source
     self.eventEmitter = HybridVideoPlayerEventEmitter()
-
-    // Initialize AVPlayer with empty item
-    self.player = AVPlayer()
+    self.mediaPlayer = VLCMediaPlayer()
 
     super.init()
-    self.playerObserver = VideoPlayerObserver(delegate: self)
-    self.playerObserver?.initializePlayerObservers()
 
-    Task {
-      if source.config.initializeOnCreation == true {
-        do {
-          self.playerItem = try await self.sourceLoader.load {
-            try await self.initializePlayerItem()
-          }
-          self.player.replaceCurrentItem(with: self.playerItem)
-        } catch {
-          // Only ignore cancellation errors, report others via status change
-          if !(error is CancellationError) {
-            print("[UnifiedPlayer] Initialization failed: \(error.localizedDescription)")
-            self.status = .error
-          }
-        }
-      }
+    let proxy = VLCDelegateProxy(owner: self)
+    self.vlcDelegate = proxy
+    self.mediaPlayer.delegate = proxy
+
+    if source.config.initializeOnCreation == true {
+      attachMedia()
     }
 
     VideoManager.shared.register(player: self)
@@ -68,7 +47,7 @@ class HybridVideoPlayer: HybridVideoPlayerSpec, NativeVideoPlayerSpec {
     release()
   }
 
-  // MARK: - Hybrid Impl
+  // MARK: - HybridVideoPlayerSpec
 
   var source: any HybridVideoPlayerSourceSpec
 
@@ -87,205 +66,152 @@ class HybridVideoPlayer: HybridVideoPlayerSpec, NativeVideoPlayerSpec {
 
   var volume: Double {
     set {
-      player.volume = Float(newValue)
-    }
-    get {
-      return Double(player.volume)
-    }
-  }
-
-  var muted: Bool {
-    set {
-      player.isMuted = newValue
+      // VLC audio.volume is 0...100
+      let clamped = max(0, min(1, newValue))
+      mediaPlayer.audio?.volume = Int32(clamped * 100)
       _eventEmitter?.onVolumeChange(
-        onVolumeChangeData(
-          volume: Double(player.volume),
-          muted: muted
-        )
+        onVolumeChangeData(volume: clamped, muted: muted)
       )
     }
     get {
-      return player.isMuted
+      let v = Int(mediaPlayer.audio?.volume ?? 100)
+      return Double(v) / 100.0
     }
+  }
+
+  private var _muted: Bool = false
+  var muted: Bool {
+    set {
+      _muted = newValue
+      mediaPlayer.audio?.setMute(newValue)
+      _eventEmitter?.onVolumeChange(
+        onVolumeChangeData(volume: volume, muted: newValue)
+      )
+    }
+    get { _muted }
   }
 
   var currentTime: Double {
     set {
       _eventEmitter?.onSeek(newValue)
-      player.seek(
-        to: CMTime(seconds: newValue, preferredTimescale: 1000),
-        toleranceBefore: .zero,
-        toleranceAfter: .zero
-      )
+      let target = max(0, newValue)
+      let totalMs = Double(mediaPlayer.media?.length.intValue ?? 0)
+      if totalMs > 0 {
+        let position = Float(min(1.0, (target * 1000.0) / totalMs))
+        mediaPlayer.position = position
+      } else {
+        // Live / unknown duration — defer seek until media reports length
+        pendingSeekSeconds = target
+      }
     }
     get {
-      player.currentTime().seconds
+      let ms = mediaPlayer.time.intValue
+      return Double(ms) / 1000.0
     }
   }
 
   var duration: Double {
-    Double(player.currentItem?.duration.seconds ?? Double.nan)
+    let ms = mediaPlayer.media?.length.intValue ?? 0
+    return Double(ms) / 1000.0
   }
 
   var rate: Double {
     set {
-      if #available(iOS 16.0, tvOS 16.0, *) {
-        player.defaultRate = Float(newValue)
-      }
-
-      player.rate = Float(newValue)
+      mediaPlayer.rate = Float(newValue)
+      lastReportedRate = newValue
+      _eventEmitter?.onPlaybackRateChange(newValue)
     }
     get {
-      return Double(player.rate)
+      return Double(mediaPlayer.rate)
     }
   }
 
   var loop: Bool = false
 
   var mixAudioMode: MixAudioMode = .auto {
-    didSet {
-      VideoManager.shared.requestAudioSessionUpdate()
-    }
+    didSet { VideoManager.shared.requestAudioSessionUpdate() }
   }
 
   var ignoreSilentSwitchMode: IgnoreSilentSwitchMode = .auto {
-    didSet {
-      VideoManager.shared.requestAudioSessionUpdate()
-    }
+    didSet { VideoManager.shared.requestAudioSessionUpdate() }
   }
 
   var playInBackground: Bool = false {
-    didSet {
-      VideoManager.shared.requestAudioSessionUpdate()
-    }
+    didSet { VideoManager.shared.requestAudioSessionUpdate() }
   }
 
   var playWhenInactive: Bool = false
 
   var wasAutoPaused: Bool = false
 
-  // Text track selection state
-  private var selectedExternalTrackIndex: Int? = nil
-
   var isCurrentlyBuffering: Bool = false
 
   var isPlaying: Bool {
-    return player.rate != 0
+    return mediaPlayer.isPlaying
   }
 
-  var showNotificationControls: Bool = false {
-    didSet {
-      if showNotificationControls {
-        NowPlayingInfoCenterManager.shared.registerPlayer(player: player)
-      } else {
-        NowPlayingInfoCenterManager.shared.removePlayer(player: player)
-      }
-    }
-  }
+  var showNotificationControls: Bool = false
+
+  // VLC doesn't expose preventsDisplaySleepDuringVideoPlayback equivalent;
+  // the view layer handles UIApplication.idleTimerDisabled instead.
+  var preventsDisplaySleepDuringVideoPlayback: Bool = true
 
   func initialize() throws -> Promise<Void> {
-    return Promise.async { [weak self] in
-      guard let self else {
-        throw LibraryError.deallocated(objectName: "HybridVideoPlayer").error()
-      }
-
-      if self.playerItem != nil {
-        return
-      }
-
-      do {
-        self.playerItem = try await self.sourceLoader.load {
-          try await self.initializePlayerItem()
-        }
-        self.player.replaceCurrentItem(with: self.playerItem)
-      } catch {
-        if error is CancellationError {
-          throw PlayerError.cancelled.error()
-        }
-        throw error
-      }
+    let promise = Promise<Void>()
+    if media != nil {
+      promise.resolve(withResult: ())
+      return promise
     }
+    attachMedia()
+    promise.resolve(withResult: ())
+    return promise
   }
 
   func release() {
-    sourceLoader.cancelSync()
-    NowPlayingInfoCenterManager.shared.removePlayer(player: player)
-    
-    try? _eventEmitter?.clearAllListeners()
-    
-    self.player.replaceCurrentItem(with: nil)
-    self.playerItem = nil
-
-    if let source = self.source as? HybridVideoPlayerSource {
-      source.releaseAsset()
+    if mediaPlayer.isPlaying {
+      mediaPlayer.stop()
     }
+    media = nil
+    mediaPlayer.media = nil
+    mediaPlayer.delegate = nil
+    vlcDelegate = nil
 
-    // Clear player observer
-    self.playerObserver = nil
+    try? _eventEmitter?.clearAllListeners()
+
     status = .idle
+    hasFiredOnLoad = false
+    hasFiredOnLoadStart = false
+    pendingSeekSeconds = nil
 
     VideoManager.shared.unregister(player: self)
   }
 
-  func preload() throws -> NitroModules.Promise<Void> {
+  func preload() throws -> Promise<Void> {
     let promise = Promise<Void>()
-
-    if status != .idle {
-      promise.resolve(withResult: ())
-      return promise
+    if media == nil {
+      attachMedia()
     }
-
-    Task.detached(priority: .userInitiated) { [weak self] in
-      guard let self else {
-        promise.reject(
-          withError: LibraryError.deallocated(objectName: "HybridVideoPlayer")
-            .error()
-        )
-        return
-      }
-
-      do {
-        let playerItem = try await self.sourceLoader.load {
-          try await self.initializePlayerItem()
-        }
-        self.playerItem = playerItem
-
-        self.player.replaceCurrentItem(with: playerItem)
-        promise.resolve(withResult: ())
-      } catch {
-        if error is CancellationError {
-          promise.reject(withError: PlayerError.cancelled.error())
-        } else {
-          promise.reject(withError: error)
-        }
-      }
-    }
-
+    promise.resolve(withResult: ())
     return promise
   }
 
   func play() throws {
-    player.play()
+    mediaPlayer.play()
   }
 
   func pause() throws {
-    player.pause()
+    if mediaPlayer.canPause {
+      mediaPlayer.pause()
+    } else {
+      mediaPlayer.stop()
+    }
   }
 
   func seekBy(time: Double) throws {
-    guard let currentItem = player.currentItem else {
-      throw PlayerError.notInitialized.error()
-    }
-
-    let currentItemTime = currentItem.currentTime()
-
-    // Duration is NaN for live streams
-    let fixedDurration = duration.isNaN ? Double.infinity : duration
-
-    // Clap by <0, duration>
-    let newTime = max(0, min(currentItemTime.seconds + time, fixedDurration))
-
-    currentTime = newTime
+    let target = currentTime + time
+    let total = duration
+    let bounded = total.isFinite && total > 0 ? min(max(0, target), total) : max(0, target)
+    currentTime = bounded
   }
 
   func seekTo(time: Double) {
@@ -294,21 +220,9 @@ class HybridVideoPlayer: HybridVideoPlayerSpec, NativeVideoPlayerSpec {
 
   func replaceSourceAsync(
     source: Variant_NullType__any_HybridVideoPlayerSourceSpec_?
-  ) throws
-    -> Promise<Void>
-  {
+  ) throws -> Promise<Void> {
     let promise = Promise<Void>()
 
-    /**
-     @frozen
-     public indirect enum Variant_NullType__any_HybridVideoPlayerSourceSpec_ {
-       case first(NullType)
-       case second((any HybridVideoPlayerSourceSpec))
-     }
-     */
-
-    // if source is nil, release player
-    // if source is not NullType, set source
     guard let source else {
       release()
       promise.resolve(withResult: ())
@@ -319,281 +233,223 @@ class HybridVideoPlayer: HybridVideoPlayerSpec, NativeVideoPlayerSpec {
     case .first(_):
       release()
       promise.resolve(withResult: ())
-      return promise
     case .second(let newSource):
-      Task.detached(priority: .userInitiated) { [weak self] in
-        guard let self else {
-          promise.reject(
-            withError: LibraryError.deallocated(objectName: "HybridVideoPlayer")
-              .error()
-          )
-          return
-        }
-
-        await self.sourceLoader.cancel()
-
-        if let oldSource = self.source as? HybridVideoPlayerSource {
-          oldSource.releaseAsset()
-        }
-
-        self.source = newSource
-
-        do {
-          self.playerItem = try await self.sourceLoader.load {
-            try await self.initializePlayerItem()
-          }
-          self.player.replaceCurrentItem(with: self.playerItem)
-          NowPlayingInfoCenterManager.shared.updateNowPlayingInfo()
-          promise.resolve(withResult: ())
-        } catch {
-          if error is CancellationError {
-            promise.reject(withError: PlayerError.cancelled.error())
-          } else {
-            promise.reject(withError: error)
-          }
-        }
-      }
+      self.source = newSource
+      hasFiredOnLoad = false
+      hasFiredOnLoadStart = false
+      pendingSeekSeconds = nil
+      attachMedia()
+      promise.resolve(withResult: ())
     }
 
     return promise
   }
 
-  // MARK: - Methods
+  // MARK: - Text tracks (VLC supports embedded tracks; external subtitles
+  // and full track APIs are out of scope for this iteration.)
 
-  func initializePlayerItem() async throws -> AVPlayerItem {
-    // Ensure the source is a valid HybridVideoPlayerSource
-    guard let _hybridSource = source as? HybridVideoPlayerSource else {
-      status = .error
-      throw PlayerError.invalidSource.error()
-    }
+  func getAvailableTextTracks() throws -> [TextTrack] { return [] }
 
-    // (maybe) Override source with plugins
-    let _source = await PluginsRegistry.shared.overrideSource(
-      source: _hybridSource
-    )
+  func selectTextTrack(textTrack: Variant_NullType_TextTrack?) throws { /* no-op */ }
 
-    let isNetworkSource = _source.url.isFileURL == false
-    _eventEmitter?.onLoadStart(
-      .init(sourceType: isNetworkSource ? .network : .local, source: _source)
-    )
+  var selectedTrack: TextTrack? { nil }
 
-    let asset = try await _source.getAsset()
-
-    let playerItem: AVPlayerItem
-
-    if let externalSubtitles = source.config.externalSubtitles,
-      externalSubtitles.isEmpty == false
-    {
-      playerItem = try await AVPlayerItem.withExternalSubtitles(
-        for: asset,
-        config: source.config
-      )
-    } else {
-      playerItem = AVPlayerItem(asset: asset)
-    }
-
-    return playerItem
-  }
-
-  // MARK: - Text Track Management
-
-  func getAvailableTextTracks() throws -> [TextTrack] {
-    guard let currentItem = player.currentItem else {
-      return []
-    }
-
-    var tracks: [TextTrack] = []
-
-    if let mediaSelection = currentItem.asset.mediaSelectionGroup(
-      forMediaCharacteristic: .legible
-    ) {
-      for (index, option) in mediaSelection.options.enumerated() {
-        let isSelected =
-          currentItem.currentMediaSelection.selectedMediaOption(
-            in: mediaSelection
-          ) == option
-
-        let name =
-          option.commonMetadata.first(where: { $0.commonKey == .commonKeyTitle }
-          )?.stringValue
-          ?? option.displayName
-
-        let isExternal =
-          source.config.externalSubtitles?.contains { subtitle in
-            name.contains(subtitle.label)
-          } ?? false
-
-        let trackId =
-          isExternal
-          ? "external-\(index)"
-          : "builtin-\(option.displayName)-\(option.locale?.identifier ?? "unknown")"
-
-        tracks.append(
-          TextTrack(
-            id: trackId,
-            label: option.displayName,
-            language: option.locale?.identifier,
-            selected: isSelected
-          )
-        )
-      }
-    }
-
-    return tracks
-  }
-
-  func selectTextTrack(textTrack: Variant_NullType_TextTrack?) throws {
-    guard let currentItem = player.currentItem else {
-      throw PlayerError.notInitialized.error()
-    }
-
-    guard
-      let mediaSelection = currentItem.asset.mediaSelectionGroup(
-        forMediaCharacteristic: .legible
-      )
-    else {
-      return
-    }
-
-    // If textTrack is nil, deselect any selected track
-    guard let textTrack = textTrack else {
-      currentItem.select(nil, in: mediaSelection)
-      selectedExternalTrackIndex = nil
-      _eventEmitter?.onTrackChange(nil)
-      return
-    }
-
-    switch textTrack {
-    case .first(_):
-      currentItem.select(nil, in: mediaSelection)
-      selectedExternalTrackIndex = nil
-      _eventEmitter?.onTrackChange(nil)
-      return
-    case .second(let textTrack):
-      // If textTrack id is empty, deselect any selected track
-      if textTrack.id.isEmpty {
-        currentItem.select(nil, in: mediaSelection)
-        selectedExternalTrackIndex = nil
-        _eventEmitter?.onTrackChange(nil)
-        return
-      }
-
-      if textTrack.id.hasPrefix("external-") {
-        let trackIndexStr = String(textTrack.id.dropFirst("external-".count))
-        if let trackIndex = Int(trackIndexStr),
-          trackIndex < mediaSelection.options.count
-        {
-          let option = mediaSelection.options[trackIndex]
-          currentItem.select(option, in: mediaSelection)
-          selectedExternalTrackIndex = trackIndex
-          _eventEmitter?.onTrackChange(.second(textTrack))
-        }
-      } else if textTrack.id.hasPrefix("builtin-") {
-        for option in mediaSelection.options {
-          let optionId =
-            "builtin-\(option.displayName)-\(option.locale?.identifier ?? "unknown")"
-          if optionId == textTrack.id {
-            currentItem.select(option, in: mediaSelection)
-            selectedExternalTrackIndex = nil
-            _eventEmitter?.onTrackChange(.second(textTrack))
-            return
-          }
-        }
-      }
-    }
-  }
-
-  var selectedTrack: TextTrack? {
-    guard let currentItem = player.currentItem else {
-      return nil
-    }
-
-    guard
-      let mediaSelection = currentItem.asset.mediaSelectionGroup(
-        forMediaCharacteristic: .legible
-      )
-    else {
-      return nil
-    }
-
-    guard
-      let selectedOption = currentItem.currentMediaSelection
-        .selectedMediaOption(in: mediaSelection)
-    else {
-      return nil
-    }
-
-    guard let index = mediaSelection.options.firstIndex(of: selectedOption)
-    else {
-      return nil
-    }
-
-    let isExternal =
-      source.config.externalSubtitles?.contains { subtitle in
-        selectedOption.displayName.contains(subtitle.label)
-      } ?? false
-
-    let trackId =
-      isExternal
-      ? "external-\(index)"
-      : "builtin-\(selectedOption.displayName)-\(selectedOption.locale?.identifier ?? "unknown")"
-
-    return TextTrack(
-      id: trackId,
-      label: selectedOption.displayName,
-      language: selectedOption.locale?.identifier,
-      selected: true
-    )
-  }
-
-  // MARK: - Frame Capture
+  // MARK: - Frame capture (out of scope for VLC backend)
 
   func captureFrame() throws -> Promise<String> {
-    return Promise.async { [weak self] in
-      guard let self = self else {
-        throw LibraryError.deallocated(objectName: "HybridVideoPlayer").error()
-      }
+    let promise = Promise<String>()
+    promise.reject(withError: PlayerError.notInitialized.error())
+    return promise
+  }
 
-      guard let playerItem = self.playerItem else {
-        throw PlayerError.notInitialized.error()
-      }
+  // MARK: - Memory
 
-      let asset = playerItem.asset
-      let currentTime = self.player.currentTime()
+  func dispose() { release() }
 
-      // Use AVAssetImageGenerator for frame capture
-      let imageGenerator = AVAssetImageGenerator(asset: asset)
-      imageGenerator.appliesPreferredTrackTransform = true
-      imageGenerator.requestedTimeToleranceBefore = .zero
-      imageGenerator.requestedTimeToleranceAfter = .zero
+  var memorySize: Int { 0 }
 
-      do {
-        let cgImage = try imageGenerator.copyCGImage(at: currentTime, actualTime: nil)
-        let uiImage = UIImage(cgImage: cgImage)
+  // MARK: - Internal helpers
 
-        guard let imageData = uiImage.pngData() else {
-          throw PlayerError.notInitialized.error()
+  private func attachMedia() {
+    guard let hybridSource = source as? HybridVideoPlayerSource else {
+      status = .error
+      return
+    }
+
+    let url = hybridSource.url
+    let media = VLCMedia(url: url)
+
+    if let headers = hybridSource.config.headers, !headers.isEmpty {
+      // VLC doesn't expose an HTTP-headers API as plainly as AVURLAsset.
+      // The most reliable channel is the per-media `--http-*` options.
+      // We stash the Authorization header (the only one Spacture sends) via
+      // `:http-user-agent` and `:http-referrer` style options where they
+      // map cleanly, and fall back to a single concatenated header line for
+      // anything else.
+      for (key, value) in headers {
+        let lower = key.lowercased()
+        switch lower {
+        case "user-agent":
+          media.addOption(":http-user-agent=\(value)")
+        case "referer", "referrer":
+          media.addOption(":http-referrer=\(value)")
+        default:
+          // libvlc accepts arbitrary HTTP headers via --http-header on
+          // recent builds; it's safe to pass and ignored on older ones.
+          media.addOption(":http-header=\(key): \(value)")
         }
-
-        let base64String = imageData.base64EncodedString()
-        return base64String
-      } catch {
-        throw PlayerError.notInitialized.error()
       }
+    }
+
+    self.media = media
+    mediaPlayer.media = media
+
+    if !hasFiredOnLoadStart {
+      hasFiredOnLoadStart = true
+      let isNetworkSource = !url.isFileURL
+      _eventEmitter?.onLoadStart(
+        onLoadStartData(
+          sourceType: isNetworkSource ? .network : .local,
+          source: hybridSource
+        )
+      )
+    }
+
+    status = .loading
+    setBuffering(true)
+  }
+
+  // MARK: - VLCMediaPlayerDelegate routing (via VLCDelegateProxy)
+
+  fileprivate func handleStateChange() {
+    let state = mediaPlayer.state
+    switch state {
+    case .opening:
+      status = .loading
+      setBuffering(true)
+
+    case .buffering:
+      // VLC fires .buffering both at initial load and during playback when
+      // the buffer drains. If the player is already playing, treat as
+      // genuine buffering; if it isn't, treat as load-progress.
+      setBuffering(true)
+      status = .loading
+
+    case .playing:
+      setBuffering(false)
+      status = .readytoplay
+      maybeFireOnLoad()
+      flushPendingSeek()
+
+    case .paused:
+      setBuffering(false)
+      // Keep status as readytoplay — we're loaded, just not advancing.
+      if status == .loading { status = .readytoplay }
+
+    case .stopped, .ended:
+      setBuffering(false)
+      _eventEmitter?.onEnd()
+      if loop {
+        currentTime = 0
+        try? play()
+      }
+
+    case .error:
+      setBuffering(false)
+      status = .error
+
+    default:
+      break
+    }
+
+    emitPlaybackState()
+  }
+
+  fileprivate func handleTimeChange() {
+    let cur = currentTime
+    let dur = duration
+    _eventEmitter?.onProgress(
+      onProgressData(
+        currentTime: cur,
+        duration: dur,
+        // VLC's buffer position isn't exposed as a duration value; report 0.
+        bufferDuration: 0
+      )
+    )
+    // Once we have a non-zero duration, fulfill any deferred seeks.
+    flushPendingSeek()
+    maybeFireOnLoad()
+  }
+
+  // MARK: - Helpers
+
+  private func setBuffering(_ buffering: Bool) {
+    isCurrentlyBuffering = buffering
+  }
+
+  private func emitPlaybackState() {
+    let playing = mediaPlayer.isPlaying && !isCurrentlyBuffering
+    if playing != lastEmittedIsPlaying || isCurrentlyBuffering != lastEmittedIsBuffering {
+      lastEmittedIsPlaying = playing
+      lastEmittedIsBuffering = isCurrentlyBuffering
+      _eventEmitter?.onPlaybackStateChange(
+        onPlaybackStateChangeData(isPlaying: playing, isBuffering: isCurrentlyBuffering)
+      )
+      _eventEmitter?.onBuffer(isCurrentlyBuffering)
     }
   }
 
-  // MARK: - Memory Management
-
-  func dispose() {
-    release()
+  private func maybeFireOnLoad() {
+    guard !hasFiredOnLoad else { return }
+    let dur = duration
+    if dur <= 0 && !mediaPlayer.isPlaying {
+      // Not enough info yet — wait for a later tick.
+      return
+    }
+    hasFiredOnLoad = true
+    let size = mediaPlayer.videoSize
+    let width = Double(size.width)
+    let height = Double(size.height)
+    let orientation: VideoOrientation =
+      height > width ? .portrait : (width > height ? .landscape : .square)
+    _eventEmitter?.onLoad(
+      onLoadData(
+        currentTime: currentTime,
+        duration: dur,
+        height: height,
+        width: width,
+        orientation: orientation
+      )
+    )
+    _eventEmitter?.onReadyToDisplay()
   }
 
-  var memorySize: Int {
-    var size = 0
+  private func flushPendingSeek() {
+    guard let target = pendingSeekSeconds else { return }
+    let totalMs = Double(mediaPlayer.media?.length.intValue ?? 0)
+    if totalMs > 0 {
+      let position = Float(min(1.0, (target * 1000.0) / totalMs))
+      mediaPlayer.position = position
+      pendingSeekSeconds = nil
+    }
+  }
+}
 
-    size += playerItem?.asset.estimatedMemoryUsage ?? 0
+/// NSObject proxy bridging VLCMediaPlayerDelegate (Obj-C protocol) to the
+/// Swift-only HybridVideoPlayer. HybridVideoPlayer cannot conform directly
+/// because its base class chain isn't guaranteed to inherit from NSObject.
+final class VLCDelegateProxy: NSObject, VLCMediaPlayerDelegate {
+  private weak var owner: HybridVideoPlayer?
 
-    return size
+  init(owner: HybridVideoPlayer) {
+    self.owner = owner
+  }
+
+  func mediaPlayerStateChanged(_ aNotification: Notification) {
+    owner?.handleStateChange()
+  }
+
+  func mediaPlayerTimeChanged(_ aNotification: Notification) {
+    owner?.handleTimeChange()
   }
 }

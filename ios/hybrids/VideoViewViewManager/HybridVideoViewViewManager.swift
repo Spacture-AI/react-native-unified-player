@@ -6,7 +6,6 @@
 //
 
 import Foundation
-import AVKit
 import NitroModules
 
 struct ViewListenerPair {
@@ -205,7 +204,8 @@ class HybridVideoViewViewManager: HybridVideoViewViewManagerSpec {
   }
   
   func canEnterPictureInPicture() -> Bool {
-    return AVPictureInPictureController.isPictureInPictureSupported()
+    // PiP is not supported on the VLC backend.
+    return false
   }
   
   // MARK: - Listener registration methods

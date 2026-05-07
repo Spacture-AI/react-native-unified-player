@@ -14,6 +14,7 @@ Pod::Spec.new do |s|
   s.source       = { :git => "https://github.com/blueromans/react-native-unified-player.git", :tag => "#{s.version}" }
 
   s.dependency "React-Core"
+  s.dependency "MobileVLCKit", "~> 3.6.0"
 
   s.source_files = [
     "ios/*.{h,m,mm,swift}",

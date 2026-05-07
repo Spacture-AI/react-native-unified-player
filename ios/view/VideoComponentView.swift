@@ -3,129 +3,56 @@
 //  ReactNativeVideo
 //
 //  Created by Krzysztof Moch on 30/09/2024.
+//  VLC backend rewrite — replaces AVPlayerViewController with a UIView that
+//  serves as the VLCMediaPlayer drawable.
 //
 
-import AVFoundation
-import AVKit
 import Foundation
+import MobileVLCKit
 import UIKit
 
 @objc public class VideoComponentView: UIView {
   public weak var player: HybridVideoPlayerSpec? = nil {
     didSet {
-      guard let player = player as? HybridVideoPlayer else { return }
-      configureAVPlayerViewController(with: player.player)
+      attachCurrentPlayer()
     }
   }
 
   var delegate: VideoViewDelegate?
-  private var playerView: UIView? = nil
 
-  private var observer: VideoComponentViewObserver? {
-    didSet {
-      playerViewController?.delegate = observer
-      observer?.updatePlayerViewControllerObservers()
-    }
-  }
+  /// The UIView VLC renders into. We keep this distinct from `self` so that
+  /// resize-mode adjustments only affect the video surface, not the
+  /// container's interaction targets / overlays.
+  private var drawableView: UIView!
 
   private var _keepScreenAwake: Bool = false
   var keepScreenAwake: Bool {
-    get {
-      guard let player = player as? HybridVideoPlayer else { return false }
-      return player.player.preventsDisplaySleepDuringVideoPlayback
-    }
+    get { _keepScreenAwake }
     set {
-      guard let player = player as? HybridVideoPlayer else { return }
-      player.player.preventsDisplaySleepDuringVideoPlayback = newValue
       _keepScreenAwake = newValue
-    }
-  }
-
-  var playerViewController: AVPlayerViewController? {
-    didSet {
-      guard let observer, let playerViewController else { return }
-      playerViewController.delegate = observer
-      observer.updatePlayerViewControllerObservers()
-    }
-  }
-
-  /// User's controls setting (preserved for when exiting fullscreen)
-  private var _userControls: Bool = false
-
-  /// Whether currently in fullscreen mode
-  private var _isFullscreen: Bool = false
-
-  public var controls: Bool = false {
-    didSet {
-      _userControls = controls
-      DispatchQueue.main.async { [weak self] in
-        guard let self = self, let playerViewController = self.playerViewController else { return }
-        // In fullscreen, always show controls; otherwise respect user setting
-        playerViewController.showsPlaybackControls = self._isFullscreen ? true : self.controls
+      DispatchQueue.main.async {
+        UIApplication.shared.isIdleTimerDisabled = newValue
       }
     }
   }
 
-  /// Called when entering fullscreen to enable controls overlay
-  func onEnterFullscreen() {
-    _isFullscreen = true
-    DispatchQueue.main.async { [weak self] in
-      guard let self = self, let playerViewController = self.playerViewController else { return }
-      playerViewController.showsPlaybackControls = true
-    }
-  }
+  /// Controls overlay isn't supported on the VLC backend; the prop is
+  /// preserved for API compat but is a no-op.
+  public var controls: Bool = false
 
-  /// Called when exiting fullscreen to restore user's controls setting
-  func onExitFullscreen() {
-    _isFullscreen = false
-    DispatchQueue.main.async { [weak self] in
-      guard let self = self, let playerViewController = self.playerViewController else { return }
-      playerViewController.showsPlaybackControls = self._userControls
-    }
-  }
-
-  public var allowsPictureInPicturePlayback: Bool = false {
-    didSet {
-      DispatchQueue.main.async { [weak self] in
-        guard let self = self, let playerViewController = self.playerViewController else { return }
-
-        VideoManager.shared.requestAudioSessionUpdate()
-        playerViewController.allowsPictureInPicturePlayback = self.allowsPictureInPicturePlayback
-      }
-    }
-  }
-
-  public var autoEnterPictureInPicture: Bool = false {
-    didSet {
-      DispatchQueue.main.async { [weak self] in
-        guard let self = self, let playerViewController = self.playerViewController else { return }
-
-        VideoManager.shared.requestAudioSessionUpdate()
-        playerViewController.canStartPictureInPictureAutomaticallyFromInline =
-          self.autoEnterPictureInPicture
-      }
-    }
-  }
+  public var allowsPictureInPicturePlayback: Bool = false
+  public var autoEnterPictureInPicture: Bool = false
 
   public var resizeMode: ResizeMode = .none {
-    didSet {
-      DispatchQueue.main.async { [weak self] in
-        guard let self = self, let playerViewController = self.playerViewController else { return }
-        playerViewController.videoGravity = resizeMode.toVideoGravity()
-      }
-    }
+    didSet { applyResizeMode() }
   }
 
   /// Track if we need to send pending nitroId change event
   private var pendingNitroIdEvent = false
 
-  /// RCTDirectEventBlock callback for notifying JS when nitroId changes
-  /// This matches the type expected by RCT_EXPORT_VIEW_PROPERTY(onNitroIdChange, RCTDirectEventBlock)
   @objc public var onNitroIdChange: (([String: Any]) -> Void)? {
     didSet {
-      // If nitroId was already set before callback was available, fire the event now
       if pendingNitroIdEvent, let callback = onNitroIdChange {
-        print("[UnifiedPlayer] Firing pending onNitroIdChange with nitroId: \(nitroId)")
         callback(["nitroId": nitroId])
         pendingNitroIdEvent = false
       }
@@ -134,15 +61,11 @@ import UIKit
 
   @objc public var nitroId: NSNumber = -1 {
     didSet {
-      print("[UnifiedPlayer] VideoComponentView nitroId set to: \(nitroId)")
       VideoComponentView.globalViewsMap.setObject(self, forKey: nitroId)
-      // Notify JS that nitroId has been set
       if let callback = onNitroIdChange {
-        print("[UnifiedPlayer] Calling onNitroIdChange callback with nitroId: \(nitroId)")
         callback(["nitroId": nitroId])
         pendingNitroIdEvent = false
       } else {
-        print("[UnifiedPlayer] onNitroIdChange callback not yet set, marking as pending")
         pendingNitroIdEvent = true
       }
     }
@@ -153,9 +76,9 @@ import UIKit
 
   @objc public override init(frame: CGRect) {
     super.init(frame: frame)
+    backgroundColor = .black
     VideoManager.shared.register(view: self)
-    setupPlayerView()
-    observer = VideoComponentViewObserver(view: self)
+    setupDrawableView()
   }
 
   deinit {
@@ -164,163 +87,107 @@ import UIKit
 
   @objc public required init?(coder: NSCoder) {
     super.init(coder: coder)
-    setupPlayerView()
+    backgroundColor = .black
+    setupDrawableView()
   }
 
   func setNitroId(nitroId: NSNumber) {
     self.nitroId = nitroId
   }
 
-  private func setupPlayerView() {
-    // Create a UIView to hold the video player layer
-    playerView = UIView(frame: self.bounds)
-    playerView?.translatesAutoresizingMaskIntoConstraints = false
-    if let playerView = playerView {
-      addSubview(playerView)
-      NSLayoutConstraint.activate([
-        playerView.leadingAnchor.constraint(equalTo: self.leadingAnchor),
-        playerView.trailingAnchor.constraint(equalTo: self.trailingAnchor),
-        playerView.topAnchor.constraint(equalTo: self.topAnchor),
-        playerView.bottomAnchor.constraint(equalTo: self.bottomAnchor),
-      ])
-    }
+  private func setupDrawableView() {
+    drawableView = UIView(frame: bounds)
+    drawableView.backgroundColor = .black
+    drawableView.translatesAutoresizingMaskIntoConstraints = false
+    addSubview(drawableView)
+    NSLayoutConstraint.activate([
+      drawableView.leadingAnchor.constraint(equalTo: leadingAnchor),
+      drawableView.trailingAnchor.constraint(equalTo: trailingAnchor),
+      drawableView.topAnchor.constraint(equalTo: topAnchor),
+      drawableView.bottomAnchor.constraint(equalTo: bottomAnchor),
+    ])
   }
 
-  public func configureAVPlayerViewController(with player: AVPlayer) {
+  private func attachCurrentPlayer() {
+    guard let hybridPlayer = player as? HybridVideoPlayer else { return }
     DispatchQueue.main.async { [weak self] in
-      guard let self = self, let playerView = self.playerView else { return }
-
-      // Skip reconfiguration if player hasn't changed and controller already exists
-      if let existingController = self.playerViewController,
-        existingController.player === player
-      {
-        return
-      }
-
-      // Remove previous controller if any
-      self.playerViewController?.willMove(toParent: nil)
-      self.playerViewController?.view.removeFromSuperview()
-      self.playerViewController?.removeFromParent()
-
-      let controller = AVPlayerViewController()
-      controller.player = player
-      controller.showsPlaybackControls = controls
-      controller.videoGravity = self.resizeMode.toVideoGravity()
-      controller.view.frame = playerView.bounds
-      controller.view.autoresizingMask = [.flexibleWidth, .flexibleHeight]
-      controller.view.backgroundColor = .clear
-
-      // We manage this manually in NowPlayingInfoCenterManager
-      controller.updatesNowPlayingInfoCenter = false
-
-      if #available(iOS 16.0, *) {
-        if let initialSpeed = controller.speeds.first(where: { $0.rate == player.rate }) {
-          controller.selectSpeed(initialSpeed)
-        }
-      }
-       // Disable video frame analysis to prevent visual lookup
-      if #available(iOS 16.0, iPadOS 16.0, macCatalyst 18.0, *) {
-        controller.allowsVideoFrameAnalysis = false
-      }
-
-      // Find nearest UIViewController
-      if let parentVC = self.findViewController() {
-        parentVC.addChild(controller)
-        playerView.addSubview(controller.view)
-        controller.didMove(toParent: parentVC)
-        self.playerViewController = controller
-      }
+      guard let self = self else { return }
+      hybridPlayer.mediaPlayer.drawable = self.drawableView
+      self.applyResizeMode()
     }
   }
 
-  // Helper to find nearest UIViewController
-  private func findViewController() -> UIViewController? {
-    var responder: UIResponder? = self
-    while let r = responder {
-      if let vc = r as? UIViewController {
-        return vc
+  private func applyResizeMode() {
+    guard let hybridPlayer = player as? HybridVideoPlayer else { return }
+    let mediaPlayer = hybridPlayer.mediaPlayer
+    DispatchQueue.main.async { [weak self] in
+      guard let self = self else { return }
+      switch self.resizeMode {
+      case .contain, .none:
+        // VLC default: fit-aspect (letterbox). scaleFactor=0 = auto.
+        mediaPlayer.scaleFactor = 0
+      case .cover, .stretch:
+        // Both modes fill the view. We compute scaleFactor from the ratio
+        // of view-aspect to video-aspect so the smaller side scales up to
+        // hide the letterbox. With VLC there's no clean way to anisotropic-
+        // scale through public API without char* lifetime gymnastics, so
+        // .stretch is approximated by .cover (visually identical for any
+        // source whose aspect roughly matches the view).
+        let viewSize = self.bounds.size
+        let videoSize = mediaPlayer.videoSize
+        guard
+          viewSize.width > 0, viewSize.height > 0,
+          videoSize.width > 0, videoSize.height > 0
+        else {
+          mediaPlayer.scaleFactor = 0
+          return
+        }
+        let viewAspect = viewSize.width / viewSize.height
+        let videoAspect = videoSize.width / videoSize.height
+        let scale: CGFloat = viewAspect > videoAspect
+          ? viewAspect / videoAspect
+          : videoAspect / viewAspect
+        mediaPlayer.scaleFactor = Float(scale)
       }
-      responder = r.next
     }
-    return nil
   }
 
   public override func willMove(toSuperview newSuperview: UIView?) {
     super.willMove(toSuperview: newSuperview)
-
     if newSuperview == nil {
-      PluginsRegistry.shared.notifyVideoViewDestroyed(view: self)
-
-      // We want to disable this when view is about to unmount
-      if keepScreenAwake {
-        keepScreenAwake = false
-      }
-    } else {
-      PluginsRegistry.shared.notifyVideoViewCreated(view: self)
-
-      // We want to restore keepScreenAwake after component remount
-      if _keepScreenAwake {
-        keepScreenAwake = true
-      }
+      if keepScreenAwake { keepScreenAwake = false }
+    } else if _keepScreenAwake {
+      keepScreenAwake = true
     }
   }
 
   public override func layoutSubviews() {
     super.layoutSubviews()
-
-    // Update the frame of the playerViewController's view when the view's layout changes
-    playerViewController?.view.frame = playerView?.bounds ?? .zero
-    playerViewController?.contentOverlayView?.frame = playerView?.bounds ?? .zero
-    for subview in playerViewController?.contentOverlayView?.subviews ?? [] {
-      subview.frame = playerView?.bounds ?? .zero
-    }
+    // Reapply resize mode whenever bounds change so cover/stretch math stays
+    // in sync with the new aspect ratio.
+    applyResizeMode()
   }
 
-  public func enterFullscreen() throws {
-    guard let playerViewController else {
-      throw VideoViewError.viewIsDeallocated.error()
-    }
+  // MARK: - Fullscreen / PiP — not supported on the VLC backend
 
-    DispatchQueue.main.async {
-      playerViewController.enterFullscreen(animated: true)
-    }
+  public func enterFullscreen() throws {
+    throw VideoViewError.viewIsDeallocated.error()
   }
 
   public func exitFullscreen() throws {
-    guard let playerViewController else {
-      throw VideoViewError.viewIsDeallocated.error()
-    }
-
-    DispatchQueue.main.async {
-      playerViewController.exitFullscreen(animated: true)
-    }
+    throw VideoViewError.viewIsDeallocated.error()
   }
 
   public func startPictureInPicture() throws {
-    guard let playerViewController else {
-      throw VideoViewError.viewIsDeallocated.error()
-    }
-
-    guard AVPictureInPictureController.isPictureInPictureSupported() else {
-      throw VideoViewError.pictureInPictureNotSupported.error()
-    }
-
-    DispatchQueue.main.async {
-      // Here we skip error handling for simplicity
-      // We do check for PiP support earlier in the code
-      try? playerViewController.startPictureInPicture()
-    }
+    throw VideoViewError.pictureInPictureNotSupported.error()
   }
 
   public func stopPictureInPicture() throws {
-    guard let playerViewController else {
-      throw VideoViewError.viewIsDeallocated.error()
-    }
-
-    DispatchQueue.main.async {
-      // Here we skip error handling for simplicity
-      // We do check for PiP support earlier in the code
-      playerViewController.stopPictureInPicture()
-    }
+    throw VideoViewError.pictureInPictureNotSupported.error()
   }
+
+  // MARK: - Fullscreen lifecycle hooks (kept for API compat)
+
+  func onEnterFullscreen() { /* no-op */ }
+  func onExitFullscreen() { /* no-op */ }
 }
