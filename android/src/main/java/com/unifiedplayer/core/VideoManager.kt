@@ -153,6 +153,11 @@ object VideoManager : LifecycleEventListener {
 
     // If this was the last view using this player, clean up
     if (players[player]?.isEmpty() == true) {
+      // No surface left: stop playback unless the app opted into background audio.
+      // Otherwise ExoPlayer keeps decoding and audio continues after the screen unmounts.
+      if (!player.playInBackground && player.isPlaying) {
+        player.pause()
+      }
       players.remove(player)
     } else {
       // If there are other views using this player, move to the latest one

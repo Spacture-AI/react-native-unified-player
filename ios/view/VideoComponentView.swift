@@ -159,6 +159,10 @@ import UIKit
     super.willMove(toSuperview: newSuperview)
     if newSuperview == nil {
       if keepScreenAwake { keepScreenAwake = false }
+      // Leaving the view hierarchy (e.g. user navigated away): pause unless background playback is enabled.
+      if let hybrid = player as? HybridVideoPlayer, !hybrid.playInBackground, hybrid.isPlaying {
+        try? hybrid.pause()
+      }
     } else if _keepScreenAwake {
       keepScreenAwake = true
     }

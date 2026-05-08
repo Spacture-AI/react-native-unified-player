@@ -373,6 +373,19 @@ const VideoView = React.forwardRef<VideoViewRef, VideoViewProps>(
       []
     );
 
+    // When the view unmounts (e.g. user left the screen), pause unless background playback is enabled.
+    React.useEffect(() => {
+      return () => {
+        try {
+          if (!player.playInBackground) {
+            player.pause();
+          }
+        } catch {
+          // Player may already be released if parent teardown order differs.
+        }
+      };
+    }, [player]);
+
     // Cleanup all listeners on unmount
     React.useEffect(() => {
       return () => {
