@@ -1,7 +1,7 @@
 {
-  "name": "react-native-unified-player",
+  "name": "spactureai-mobile-player",
   "version": "1.0.25",
-  "description": "Unified Player",
+  "description": "Spacture AI Mobile Player",
   "source": "./src/index.tsx",
   "main": "./lib/module/index.js",
   "types": "./lib/typescript/src/index.d.ts",
@@ -51,14 +51,13 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/blueromans/react-native-unified-player.git"
+    "url": "git+https://github.com/Spacture-AI/react-native-unified-player.git"
   },
-  "author": "Yaşar Özyurt <blueromans@hotmail.com> (https://github.com/blueromans)",
   "license": "MIT",
   "bugs": {
-    "url": "https://github.com/blueromans/react-native-unified-player/issues"
+    "url": "https://github.com/Spacture-AI/react-native-unified-player/issues"
   },
-  "homepage": "https://github.com/blueromans/react-native-unified-player#readme",
+  "homepage": "https://github.com/Spacture-AI/react-native-unified-player#readme",
   "publishConfig": {
     "registry": "https://registry.npmjs.org/"
   },
