@@ -1,6 +1,6 @@
 {
   "name": "spactureai-mobile-player",
-  "version": "1.0.32",
+  "version": "1.0.34",
   "description": "Spacture AI Mobile Player",
   "source": "./src/index.tsx",
   "main": "./lib/module/index.js",

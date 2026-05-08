@@ -11,18 +11,53 @@ import Foundation
 import MobileVLCKit
 import NitroModules
 
-// MARK: - HLS / network tuning (conservative defaults; override via source headers if needed)
+// MARK: - HLS / network tuning (libvlc `network-caching` / `live-caching`)
 
+/// libvlc `network-caching` is a **single** input-side budget (ms). Setting it
+/// to many minutes makes VLC stay in `opening` / `buffering` for a long time
+/// before first frame — the default must stay small for CCTV/HLS. Opt into a
+/// larger window only via `VideoConfig.bufferConfig` (forward + back sum).
 private enum VLCHLSDefaults {
-  /// Milliseconds of media to prefetch before playback resumes.
-  /// VLC sits buffering for at least this long after every seek, so we
-  /// keep it small for VOD HLS (recordings) where the user expects scrub
-  /// to land near-instantly. Bump back up if you see frequent stutter.
-  static let networkCachingMs = 300
-  /// Same as above but only used when libvlc tags the stream as live; our
-  /// MediaMTX recordings are VOD, so this almost never applies. Keep it
-  /// low so the rare live tail doesn't add seconds of pre-roll.
-  static let liveCachingMs = 300
+  static let floorMs = 300
+  /// Default total when JS omits `bufferConfig` — prioritises time-to-first-frame.
+  static let defaultRemoteTotalMs = 4_000
+  /// Per-side fallback when `bufferConfig` is present but a field is nil (1 min).
+  static let bufferConfigSideFallbackMs = 60_000
+  static let hardCapMs = 2 * 3600 * 1_000
+  /// First-frame watchdog: if we never leave loading, surface `error` to JS.
+  static let firstFrameTimeoutSeconds: TimeInterval = 45
+
+  static func networkCachingMs(for config: NativeVideoConfig, sourceURL: URL) -> Int {
+    let scheme = sourceURL.scheme?.lowercased() ?? ""
+    let isRemote =
+      scheme == "http" || scheme == "https" || scheme == "rtsp" || scheme == "rtsps"
+    guard isRemote else { return floorMs }
+
+    guard let b = config.bufferConfig else {
+      return min(max(floorMs, defaultRemoteTotalMs), hardCapMs)
+    }
+
+    let side = Double(bufferConfigSideFallbackMs)
+    let forward = Int(b.preferredForwardBufferDurationMs ?? b.maxBufferMs ?? side)
+    let back = Int(b.backBufferDurationMs ?? b.minBufferMs ?? side)
+    let total = max(floorMs, forward + back)
+    return min(total, hardCapMs)
+  }
+
+  static func liveCachingMs(for config: NativeVideoConfig, networkCachingMs: Int) -> Int {
+    if let target = config.bufferConfig?.livePlayback?.targetOffsetMs, target > 0 {
+      return max(floorMs, min(Int(target), networkCachingMs))
+    }
+    return networkCachingMs
+  }
+
+  #if DEBUG
+  static func log(_ message: String) {
+    print("[UnifiedPlayer/VLC] \(message)")
+  }
+  #else
+  static func log(_ message: String) {}
+  #endif
 }
 
 final class HybridVideoPlayer: HybridVideoPlayerSpec, VLCPlaybackDelegateOwner {
@@ -59,6 +94,8 @@ final class HybridVideoPlayer: HybridVideoPlayerSpec, VLCPlaybackDelegateOwner {
   /// needs the drawable before demux/decode can finish; we re-issue `play()`
   /// from `VideoComponentView` when the surface attaches.
   private var wantsPlaybackWhenDrawableReady: Bool = false
+
+  private var loadTimeoutWorkItem: DispatchWorkItem?
 
   /// Marshal a closure onto the main thread, executing inline if we're
   /// already there. VLC's renderer (`VLCOpenGLES2VideoView`) reaches into
@@ -219,6 +256,7 @@ final class HybridVideoPlayer: HybridVideoPlayerSpec, VLCPlaybackDelegateOwner {
   }
 
   func release() {
+    cancelLoadTimeout()
     invalidateStallWatchdog()
 
     // Capture the VLC objects so they survive past `self` being
@@ -300,10 +338,14 @@ final class HybridVideoPlayer: HybridVideoPlayerSpec, VLCPlaybackDelegateOwner {
 
   /// Called from `VideoComponentView` after `mediaPlayer.drawable` is set.
   func notifyVideoHostViewAttached() {
+    VLCHLSDefaults.log(
+      "drawable attached; wantsPlayback=\(wantsPlaybackWhenDrawableReady) state=\(String(describing: mediaPlayer.state))"
+    )
     if wantsPlaybackWhenDrawableReady, media != nil {
       mediaPlayer.play()
     }
     maybeFireOnLoad()
+    emitPlaybackState()
   }
 
   func seekBy(time: Double) throws {
@@ -339,6 +381,7 @@ final class HybridVideoPlayer: HybridVideoPlayerSpec, VLCPlaybackDelegateOwner {
       promise.resolve(withResult: ())
     case .second(let newSource):
       wantsPlaybackWhenDrawableReady = false
+      cancelLoadTimeout()
       invalidateStallWatchdog()
 
       // Tear down the previous VLC media on main — same reasoning as
@@ -467,7 +510,11 @@ final class HybridVideoPlayer: HybridVideoPlayerSpec, VLCPlaybackDelegateOwner {
 
     let media = VLCMedia(url: mediaURL)
 
-    applyHlsNetworkOptions(to: media)
+    applyHlsNetworkOptions(
+      to: media,
+      sourceURL: hybridSource.url,
+      videoConfig: hybridSource.config
+    )
 
     for (key, value) in residualHeaders {
       switch key.lowercased() {
@@ -512,6 +559,8 @@ final class HybridVideoPlayer: HybridVideoPlayerSpec, VLCPlaybackDelegateOwner {
     status = .loading
     setBuffering(true)
     hasEmittedEndForCurrentItem = false
+    emitPlaybackState()
+    scheduleLoadTimeout()
   }
 
   /// Rewrite an http(s) URL to point at the local auth proxy on
@@ -529,11 +578,68 @@ final class HybridVideoPlayer: HybridVideoPlayerSpec, VLCPlaybackDelegateOwner {
     return components.url
   }
 
-  private func applyHlsNetworkOptions(to media: VLCMedia) {
-    media.addOption(":network-caching=\(VLCHLSDefaults.networkCachingMs)")
-    media.addOption(":live-caching=\(VLCHLSDefaults.liveCachingMs)")
+  private func applyHlsNetworkOptions(
+    to media: VLCMedia,
+    sourceURL: URL,
+    videoConfig: NativeVideoConfig
+  ) {
+    let scheme = sourceURL.scheme?.lowercased() ?? ""
+    let networkMs = VLCHLSDefaults.networkCachingMs(for: videoConfig, sourceURL: sourceURL)
+    let liveMs = VLCHLSDefaults.liveCachingMs(for: videoConfig, networkCachingMs: networkMs)
+    media.addOption(":network-caching=\(networkMs)")
+    media.addOption(":live-caching=\(liveMs)")
     // HLS over HTTP benefits from reconnect; harmless for file URLs.
     media.addOption(":http-reconnect=true")
+
+    // RTSP: UDP can be blocked on cellular / Wi‑Fi guest; TCP interleaved is
+    // the reliable default for CCTV / NVR streams.
+    if scheme == "rtsp" || scheme == "rtsps" {
+      media.addOption(":rtsp-tcp")
+    }
+
+    // HLS: libvlc may issue many small GETs (master + variant index.m3u8).
+    // Keep-alive amortizes TLS/TCP handshakes. Parallel segment threads help
+    // time-to-first-frame once a variant is selected. (Master still lists
+    // every variant; fastest fix for huge masters is pointing the URI at a
+    // single media playlist from the app.)
+    let path = sourceURL.absoluteString.lowercased()
+    if path.contains(".m3u8") {
+      media.addOption(":http-keep-alive=true")
+      media.addOption(":hls-segment-threads=2")
+    }
+
+    VLCHLSDefaults.log(
+      "options url=\(sourceURL.absoluteString) scheme=\(scheme) network-caching=\(networkMs) live-caching=\(liveMs)"
+    )
+  }
+
+  private func scheduleLoadTimeout() {
+    cancelLoadTimeout()
+    let item = DispatchWorkItem { [weak self] in
+      guard let self else { return }
+      guard self.media != nil else { return }
+      guard !self.hasFiredOnLoad else { return }
+      let vlcState = self.mediaPlayer.state
+      if vlcState == .playing || vlcState == .paused {
+        return
+      }
+      VLCHLSDefaults.log(
+        "first-frame timeout (state=\(String(describing: vlcState)) isPlaying=\(self.mediaPlayer.isPlaying))"
+      )
+      self.setBuffering(false)
+      self.status = .error
+      self.emitPlaybackState()
+    }
+    loadTimeoutWorkItem = item
+    DispatchQueue.main.asyncAfter(
+      deadline: .now() + VLCHLSDefaults.firstFrameTimeoutSeconds,
+      execute: item
+    )
+  }
+
+  private func cancelLoadTimeout() {
+    loadTimeoutWorkItem?.cancel()
+    loadTimeoutWorkItem = nil
   }
 
   /// Resets stall-watchdog liveness so a long seek / buffer gap is not mistaken for a dead stream.
@@ -571,6 +677,7 @@ final class HybridVideoPlayer: HybridVideoPlayerSpec, VLCPlaybackDelegateOwner {
 
   private func handleStateChange() {
     let state = mediaPlayer.state
+    VLCHLSDefaults.log("stateChange -> \(String(describing: state))")
     switch state {
     case .opening:
       status = .loading
@@ -584,6 +691,7 @@ final class HybridVideoPlayer: HybridVideoPlayerSpec, VLCPlaybackDelegateOwner {
       }
 
     case .playing:
+      cancelLoadTimeout()
       setBuffering(false)
       status = .readytoplay
       maybeFireOnLoad()
@@ -594,6 +702,7 @@ final class HybridVideoPlayer: HybridVideoPlayerSpec, VLCPlaybackDelegateOwner {
     case .paused:
       setBuffering(false)
       if status == .loading { status = .readytoplay }
+      maybeFireOnLoad()
       VideoManager.shared.requestAudioSessionUpdate()
 
     case .stopped, .ended:
@@ -609,6 +718,7 @@ final class HybridVideoPlayer: HybridVideoPlayerSpec, VLCPlaybackDelegateOwner {
       }
 
     case .error:
+      cancelLoadTimeout()
       setBuffering(false)
       status = .error
       // JS layer maps `error` status → `onError` (see VideoPlayer.ts).
@@ -661,13 +771,22 @@ final class HybridVideoPlayer: HybridVideoPlayerSpec, VLCPlaybackDelegateOwner {
     let hasDuration = dur.isFinite && dur > 0
     let size = mediaPlayer.videoSize
     let hasVideo = size.width > 0 && size.height > 0
+    let state = mediaPlayer.state
     // VOD HLS from MediaMTX may keep length at 0 until the playlist is fully
     // parsed; still emit onLoad once we are playing or have decoded dimensions
     // so JS overlays (e.g. preroll spinner) can clear.
-    if !hasDuration && !mediaPlayer.isPlaying && !hasVideo {
+    let hasBasicReadiness =
+      hasDuration || mediaPlayer.isPlaying || hasVideo
+    // First paint: VLC can report 0×0 video size and unknown duration while
+    // already past demux (paused autoplay, or drawable attached a frame late).
+    let demuxPastOpen =
+      state == .playing || state == .paused || state == .buffering
+    let relaxedReadiness = (media?.isParsed == true) && demuxPastOpen
+    if !hasBasicReadiness && !relaxedReadiness {
       return
     }
     hasFiredOnLoad = true
+    cancelLoadTimeout()
     let width = Double(size.width)
     let height = Double(size.height)
     let orientation: VideoOrientation =

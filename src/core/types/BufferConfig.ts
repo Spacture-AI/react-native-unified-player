@@ -43,12 +43,17 @@ export interface BufferConfig {
    * Minimum duration (ms) the player will attempt to keep buffered.
    * @default 5000
    * @platform android
+   * @platform ios (VLC) Back portion of `network-caching` when set; if omitted
+   *   alongside the other buffer fields, defaults to 60s for that side. Large
+   *   values delay first frame — prefer explicit tuning over huge defaults.
    */
   minBufferMs?: number;
   /**
    * Maximum duration (ms) the player will attempt to keep buffered.
    * @default 10000
    * @platform android
+   * @platform ios (VLC) Fallback for the **forward** half when
+   *   `preferredForwardBufferDurationMs` is omitted.
    */
   maxBufferMs?: number;
   /**
@@ -66,6 +71,8 @@ export interface BufferConfig {
   /**
    * Duration (ms) of media that must be buffered before it can be played from the back buffer.
    * @platform android
+   * @platform ios (VLC) Back portion of libvlc `network-caching`; if omitted
+   *   defaults to 60s when any `bufferConfig` field is set.
    */
   backBufferDurationMs?: number;
 
@@ -73,7 +80,10 @@ export interface BufferConfig {
 
   /**
    * The preferred duration (ms) of media that the player will attempt to retain in the buffer.
-   * @platform ios, visionOS, tvOS
+   * @platform ios, visionOS, tvOS — AVKit semantics where applicable.
+   * @platform ios (VLC / unified-player) Forward portion of libvlc `network-caching`
+   *   (combined with `backBufferDurationMs` / `minBufferMs`). Omit all fields to use
+   *   a small default (~4s total) for fast first frame.
    */
   preferredForwardBufferDurationMs?: number;
   /**

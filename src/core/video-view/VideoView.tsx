@@ -1,5 +1,6 @@
 import * as React from 'react';
 import type { ViewProps, ViewStyle } from 'react-native';
+import { ActivityIndicator, StyleSheet, View } from 'react-native';
 import { NitroModules } from 'react-native-nitro-modules';
 import type { ListenerSubscription } from '../../spec/nitro/VideoPlayerEventEmitter.nitro';
 import type {
@@ -14,6 +15,7 @@ import {
   VideoComponentError,
   VideoError,
 } from '../types/VideoError';
+import type { VideoPlayerStatus } from '../types/VideoPlayerStatus';
 import type { VideoPlayer } from '../VideoPlayer';
 import { NativeVideoView } from './NativeVideoView';
 
@@ -81,6 +83,16 @@ export interface VideoViewProps extends Partial<VideoViewEvents>, ViewProps {
    * The playback speed of the video. Defaults to 1.0.
    */
   speed?: number;
+  /**
+   * When true, shows a centered activity indicator while the source is
+   * loading or the native player reports buffering (initial load and rebuffer).
+   * @default false
+   */
+  showLoadingIndicator?: boolean;
+  /**
+   * @platform ios
+   */
+  loadingIndicatorColor?: string;
 }
 
 export interface VideoViewRef {
@@ -173,6 +185,8 @@ const VideoView = React.forwardRef<VideoViewRef, VideoViewProps>(
       fullscreen = false,
       paused,
       speed,
+      showLoadingIndicator = false,
+      loadingIndicatorColor,
       onPictureInPictureChange,
       onFullscreenChange,
       willEnterFullscreen,
@@ -186,6 +200,48 @@ const VideoView = React.forwardRef<VideoViewRef, VideoViewProps>(
     const nitroId = React.useMemo(() => nitroIdCounter++, []);
     const nitroViewManager = React.useRef<VideoViewViewManager | null>(null);
     const [isManagerReady, setIsManagerReady] = React.useState(false);
+
+    const [hasLoadedMedia, setHasLoadedMedia] = React.useState(false);
+    const [isBuffering, setIsBuffering] = React.useState(false);
+    const [playerStatus, setPlayerStatus] = React.useState<VideoPlayerStatus>(
+      player.status
+    );
+
+    React.useEffect(() => {
+      if (!showLoadingIndicator) {
+        return;
+      }
+      setPlayerStatus(player.status);
+      setHasLoadedMedia(player.status === 'readyToPlay');
+      const onLoadStart = () => {
+        setHasLoadedMedia(false);
+        setIsBuffering(true);
+      };
+      const onLoad = () => {
+        setHasLoadedMedia(true);
+        setIsBuffering(false);
+      };
+      const onBuffer = (buffering: boolean) => setIsBuffering(buffering);
+      const onStatus = (status: VideoPlayerStatus) => setPlayerStatus(status);
+
+      const subLoadStart = player.addEventListener('onLoadStart', onLoadStart);
+      const subLoad = player.addEventListener('onLoad', onLoad);
+      const subBuffer = player.addEventListener('onBuffer', onBuffer);
+      const subStatus = player.addEventListener('onStatusChange', onStatus);
+
+      return () => {
+        subLoadStart.remove();
+        subLoad.remove();
+        subBuffer.remove();
+        subStatus.remove();
+      };
+    }, [player, showLoadingIndicator]);
+
+    const showNativeSpinner =
+      showLoadingIndicator &&
+      playerStatus !== 'error' &&
+      playerStatus !== 'idle' &&
+      (!hasLoadedMedia || isBuffering);
 
     const setupViewManager = React.useCallback(
       (id: number) => {
@@ -477,15 +533,41 @@ const VideoView = React.forwardRef<VideoViewRef, VideoViewProps>(
       }
     }, [fullscreen, isManagerReady]);
 
+    if (!showLoadingIndicator) {
+      return (
+        <NativeVideoView
+          nitroId={nitroId}
+          onNitroIdChange={onNitroIdChange}
+          {...props}
+        />
+      );
+    }
+
     return (
-      <NativeVideoView
-        nitroId={nitroId}
-        onNitroIdChange={onNitroIdChange}
-        {...props}
-      />
+      <View style={props.style} collapsable={false}>
+        <NativeVideoView
+          nitroId={nitroId}
+          onNitroIdChange={onNitroIdChange}
+          {...props}
+          style={StyleSheet.absoluteFill}
+        />
+        {showNativeSpinner ? (
+          <View style={styles.loadingOverlay} pointerEvents="none">
+            <ActivityIndicator size="large" color={loadingIndicatorColor} />
+          </View>
+        ) : null}
+      </View>
     );
   }
 );
+
+const styles = StyleSheet.create({
+  loadingOverlay: {
+    ...StyleSheet.absoluteFillObject,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+});
 
 VideoView.displayName = 'VideoView';
 
