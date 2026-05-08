@@ -754,12 +754,17 @@ final class HybridVideoPlayer: HybridVideoPlayerSpec, VLCPlaybackDelegateOwner {
   }
 
   private func emitPlaybackState() {
-    let playing = mediaPlayer.isPlaying && !isCurrentlyBuffering
-    if playing != lastEmittedIsPlaying || isCurrentlyBuffering != lastEmittedIsBuffering {
-      lastEmittedIsPlaying = playing
+    // Match Android / `onPlaybackStateChangeData`: `isPlaying` is the
+    // decoder's play flag; `isBuffering` is separate. Combining them
+    // (`isPlaying && !buffering`) meant JS never saw `isPlaying: true`
+    // while libvlc stayed in `.buffering` — DVR seek overlays waited for
+    // a signal that never arrived even though frames were advancing.
+    let vlcIsPlaying = mediaPlayer.isPlaying
+    if vlcIsPlaying != lastEmittedIsPlaying || isCurrentlyBuffering != lastEmittedIsBuffering {
+      lastEmittedIsPlaying = vlcIsPlaying
       lastEmittedIsBuffering = isCurrentlyBuffering
       _eventEmitter?.onPlaybackStateChange(
-        onPlaybackStateChangeData(isPlaying: playing, isBuffering: isCurrentlyBuffering)
+        onPlaybackStateChangeData(isPlaying: vlcIsPlaying, isBuffering: isCurrentlyBuffering)
       )
       _eventEmitter?.onBuffer(isCurrentlyBuffering)
     }
