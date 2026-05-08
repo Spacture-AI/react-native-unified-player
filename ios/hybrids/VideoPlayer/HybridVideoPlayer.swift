@@ -3,27 +3,62 @@
 //  ReactNativeVideo
 //
 //  Created by Krzysztof Moch on 09/10/2024.
-//  VLC backend rewrite — replaces AVPlayer with MobileVLCKit.
+//  MobileVLCKit backend for HLS (MediaMTX-style manifests, relative .ts
+//  segments resolved by VLC against the playlist URL).
 //
 
 import Foundation
 import MobileVLCKit
 import NitroModules
 
-final class HybridVideoPlayer: HybridVideoPlayerSpec {
+// MARK: - HLS / network tuning (conservative defaults; override via source headers if needed)
+
+private enum VLCHLSDefaults {
+  /// Milliseconds of media to prefetch before playback resumes.
+  /// VLC sits buffering for at least this long after every seek, so we
+  /// keep it small for VOD HLS (recordings) where the user expects scrub
+  /// to land near-instantly. Bump back up if you see frequent stutter.
+  static let networkCachingMs = 300
+  /// Same as above but only used when libvlc tags the stream as live; our
+  /// MediaMTX recordings are VOD, so this almost never applies. Keep it
+  /// low so the rare live tail doesn't add seconds of pre-roll.
+  static let liveCachingMs = 300
+}
+
+final class HybridVideoPlayer: HybridVideoPlayerSpec, VLCPlaybackDelegateOwner {
 
   public let mediaPlayer: VLCMediaPlayer
   private var media: VLCMedia?
-  private var vlcDelegate: VLCDelegateProxy?
+  private var vlcDelegates: VLCPlaybackDelegates?
 
-  // Cached state — VLC doesn't surface every property as a getter we can poll
-  // safely from arbitrary threads, so we mirror what JS asks for.
+  /// Local 127.0.0.1 HTTP proxy used to inject Authorization on HLS
+  /// manifest + segment fetches. libvlc 3.x ignores `--http-header(s)`,
+  /// so we point VLC at this proxy when the JS layer passes an
+  /// Authorization header. nil when the source is unauthenticated.
+  private var authProxy: HLSAuthProxy?
+
   private var lastReportedRate: Double = 1.0
   private var hasFiredOnLoad: Bool = false
   private var hasFiredOnLoadStart: Bool = false
   private var lastEmittedIsPlaying: Bool = false
   private var lastEmittedIsBuffering: Bool = false
   private var pendingSeekSeconds: Double? = nil
+  private var hasEmittedEndForCurrentItem: Bool = false
+
+  /// Monotonic playback time from VLC; used by the stall watchdog.
+  private var lastProgressTimeSeconds: Double = 0
+  private var lastProgressTickMonotonic: TimeInterval = 0
+
+  private var stallCheckTimer: Timer?
+  private var reconnectAttempts: Int = 0
+  private static let maxAutoReconnects = 3
+  private static let stallNoProgressSeconds: TimeInterval = 4.0
+  private static let stallCheckIntervalSeconds: TimeInterval = 1.0
+
+  /// JS called `play()` before a `UIView` drawable existed — iOS VLC often
+  /// needs the drawable before demux/decode can finish; we re-issue `play()`
+  /// from `VideoComponentView` when the surface attaches.
+  private var wantsPlaybackWhenDrawableReady: Bool = false
 
   init(source: (any HybridVideoPlayerSourceSpec)) throws {
     self.source = source
@@ -32,18 +67,20 @@ final class HybridVideoPlayer: HybridVideoPlayerSpec {
 
     super.init()
 
-    let proxy = VLCDelegateProxy(owner: self)
-    self.vlcDelegate = proxy
-    self.mediaPlayer.delegate = proxy
+    let delegates = VLCPlaybackDelegates(owner: self)
+    self.vlcDelegates = delegates
+    self.mediaPlayer.delegate = delegates
 
     if source.config.initializeOnCreation == true {
       attachMedia()
     }
 
     VideoManager.shared.register(player: self)
+    startStallWatchdogIfNeeded()
   }
 
   deinit {
+    invalidateStallWatchdog()
     release()
   }
 
@@ -66,7 +103,6 @@ final class HybridVideoPlayer: HybridVideoPlayerSpec {
 
   var volume: Double {
     set {
-      // VLC audio.volume is 0...100
       let clamped = max(0, min(1, newValue))
       mediaPlayer.audio?.volume = Int32(clamped * 100)
       _eventEmitter?.onVolumeChange(
@@ -93,33 +129,30 @@ final class HybridVideoPlayer: HybridVideoPlayerSpec {
 
   var currentTime: Double {
     set {
-      _eventEmitter?.onSeek(newValue)
       let target = max(0, newValue)
-      let totalMs = Double(mediaPlayer.media?.length.intValue ?? 0)
-      if totalMs > 0 {
-        let position = Float(min(1.0, (target * 1000.0) / totalMs))
-        mediaPlayer.position = position
-      } else {
-        // Live / unknown duration — defer seek until media reports length
-        pendingSeekSeconds = target
-      }
+      _eventEmitter?.onSeek(target)
+      markUserInitiatedTransport()
+      applySeek(seconds: target)
     }
     get {
       let ms = mediaPlayer.time.intValue
+      if ms < 0 { return Double.nan }
       return Double(ms) / 1000.0
     }
   }
 
   var duration: Double {
     let ms = mediaPlayer.media?.length.intValue ?? 0
+    if ms <= 0 { return Double.nan }
     return Double(ms) / 1000.0
   }
 
   var rate: Double {
     set {
-      mediaPlayer.rate = Float(newValue)
-      lastReportedRate = newValue
-      _eventEmitter?.onPlaybackRateChange(newValue)
+      let clamped = max(0, newValue)
+      mediaPlayer.rate = Float(clamped)
+      lastReportedRate = clamped
+      _eventEmitter?.onPlaybackRateChange(clamped)
     }
     get {
       return Double(mediaPlayer.rate)
@@ -152,8 +185,6 @@ final class HybridVideoPlayer: HybridVideoPlayerSpec {
 
   var showNotificationControls: Bool = false
 
-  // VLC doesn't expose preventsDisplaySleepDuringVideoPlayback equivalent;
-  // the view layer handles UIApplication.idleTimerDisabled instead.
   var preventsDisplaySleepDuringVideoPlayback: Bool = true
 
   func initialize() throws -> Promise<Void> {
@@ -168,20 +199,30 @@ final class HybridVideoPlayer: HybridVideoPlayerSpec {
   }
 
   func release() {
+    invalidateStallWatchdog()
     if mediaPlayer.isPlaying {
       mediaPlayer.stop()
     }
+    media?.delegate = nil
     media = nil
     mediaPlayer.media = nil
     mediaPlayer.delegate = nil
-    vlcDelegate = nil
+    vlcDelegates = nil
+
+    authProxy?.stop()
+    authProxy = nil
 
     try? _eventEmitter?.clearAllListeners()
 
+    wantsPlaybackWhenDrawableReady = false
     status = .idle
     hasFiredOnLoad = false
     hasFiredOnLoadStart = false
     pendingSeekSeconds = nil
+    hasEmittedEndForCurrentItem = false
+    reconnectAttempts = 0
+    lastProgressTimeSeconds = 0
+    lastProgressTickMonotonic = 0
 
     VideoManager.shared.unregister(player: self)
   }
@@ -196,21 +237,38 @@ final class HybridVideoPlayer: HybridVideoPlayerSpec {
   }
 
   func play() throws {
+    wantsPlaybackWhenDrawableReady = true
     mediaPlayer.play()
+    VideoManager.shared.requestAudioSessionUpdate()
   }
 
   func pause() throws {
+    wantsPlaybackWhenDrawableReady = false
     if mediaPlayer.canPause {
       mediaPlayer.pause()
     } else {
       mediaPlayer.stop()
     }
+    VideoManager.shared.requestAudioSessionUpdate()
+  }
+
+  /// Called from `VideoComponentView` after `mediaPlayer.drawable` is set.
+  func notifyVideoHostViewAttached() {
+    if wantsPlaybackWhenDrawableReady, media != nil {
+      mediaPlayer.play()
+    }
+    maybeFireOnLoad()
   }
 
   func seekBy(time: Double) throws {
-    let target = currentTime + time
+    let cur = currentTime
+    let base = cur.isFinite ? cur : 0
+    let target = base + time
     let total = duration
-    let bounded = total.isFinite && total > 0 ? min(max(0, target), total) : max(0, target)
+    let bounded =
+      total.isFinite && total > 0
+      ? min(max(0, target), total)
+      : max(0, target)
     currentTime = bounded
   }
 
@@ -234,19 +292,31 @@ final class HybridVideoPlayer: HybridVideoPlayerSpec {
       release()
       promise.resolve(withResult: ())
     case .second(let newSource):
+      wantsPlaybackWhenDrawableReady = false
+      invalidateStallWatchdog()
+      if mediaPlayer.isPlaying {
+        mediaPlayer.stop()
+      }
+      media?.delegate = nil
+      media = nil
+      mediaPlayer.media = nil
+
+      authProxy?.stop()
+      authProxy = nil
+
       self.source = newSource
       hasFiredOnLoad = false
       hasFiredOnLoadStart = false
       pendingSeekSeconds = nil
+      hasEmittedEndForCurrentItem = false
+      reconnectAttempts = 0
       attachMedia()
+      startStallWatchdogIfNeeded()
       promise.resolve(withResult: ())
     }
 
     return promise
   }
-
-  // MARK: - Text tracks (VLC supports embedded tracks; external subtitles
-  // and full track APIs are out of scope for this iteration.)
 
   func getAvailableTextTracks() throws -> [TextTrack] { return [] }
 
@@ -254,19 +324,37 @@ final class HybridVideoPlayer: HybridVideoPlayerSpec {
 
   var selectedTrack: TextTrack? { nil }
 
-  // MARK: - Frame capture (out of scope for VLC backend)
-
   func captureFrame() throws -> Promise<String> {
     let promise = Promise<String>()
     promise.reject(withError: PlayerError.notInitialized.error())
     return promise
   }
 
-  // MARK: - Memory
-
   func dispose() { release() }
 
   var memorySize: Int { 0 }
+
+  // MARK: - VLCPlaybackDelegateOwner
+
+  func vlcMediaPlayerStateDidChange() {
+    handleStateChange()
+  }
+
+  func vlcMediaPlayerTimeDidChange() {
+    handleTimeChange()
+  }
+
+  func vlcMediaMetaDataDidChange(_ media: VLCMedia) {
+    _ = media
+    flushPendingSeek()
+    maybeFireOnLoad()
+  }
+
+  func vlcMediaDidFinishParsing(_ media: VLCMedia) {
+    _ = media
+    flushPendingSeek()
+    maybeFireOnLoad()
+  }
 
   // MARK: - Internal helpers
 
@@ -276,37 +364,81 @@ final class HybridVideoPlayer: HybridVideoPlayerSpec {
       return
     }
 
-    let url = hybridSource.url
-    let media = VLCMedia(url: url)
+    // Tear down any previous proxy before we (maybe) start a new one.
+    authProxy?.stop()
+    authProxy = nil
+
+    var mediaURL = hybridSource.url
+    var residualHeaders: [String: String] = [:]
+    var bearerToken: String? = nil
 
     if let headers = hybridSource.config.headers, !headers.isEmpty {
-      // VLC doesn't expose an HTTP-headers API as plainly as AVURLAsset.
-      // The most reliable channel is the per-media `--http-*` options.
-      // We stash the Authorization header (the only one Spacture sends) via
-      // `:http-user-agent` and `:http-referrer` style options where they
-      // map cleanly, and fall back to a single concatenated header line for
-      // anything else.
       for (key, value) in headers {
-        let lower = key.lowercased()
-        switch lower {
-        case "user-agent":
-          media.addOption(":http-user-agent=\(value)")
-        case "referer", "referrer":
-          media.addOption(":http-referrer=\(value)")
-        default:
-          // libvlc accepts arbitrary HTTP headers via --http-header on
-          // recent builds; it's safe to pass and ignored on older ones.
-          media.addOption(":http-header=\(key): \(value)")
+        if key.lowercased() == "authorization" {
+          // "Bearer xyz" or raw token — strip the scheme prefix; the
+          // proxy re-prepends "Bearer " uniformly on forward.
+          let trimmed = value.trimmingCharacters(in: .whitespaces)
+          if trimmed.lowercased().hasPrefix("bearer ") {
+            bearerToken = String(trimmed.dropFirst(7)).trimmingCharacters(in: .whitespaces)
+          } else {
+            bearerToken = trimmed
+          }
+        } else {
+          residualHeaders[key] = value
         }
       }
     }
 
+    // libvlc 3.x has no `--http-header(s)`, so a JS-supplied Authorization
+    // never reaches segment fetches. Route everything through a local
+    // proxy that injects the bearer on each upstream request. UA / Referer
+    // are still applied via the supported libvlc options below.
+    if let token = bearerToken,
+      let scheme = mediaURL.scheme?.lowercased(),
+      scheme == "http" || scheme == "https"
+    {
+      let proxy = HLSAuthProxy(originURL: mediaURL, bearerToken: token)
+      do {
+        try proxy.start()
+        if let localURL = buildLocalProxyURL(from: mediaURL, port: proxy.port) {
+          self.authProxy = proxy
+          mediaURL = localURL
+        } else {
+          proxy.stop()
+        }
+      } catch {
+        // Fall through with the original URL — playback will still fail
+        // upstream, but at least the player surfaces VLC's own error
+        // rather than a silent local-proxy failure.
+      }
+    }
+
+    let media = VLCMedia(url: mediaURL)
+
+    applyHlsNetworkOptions(to: media)
+
+    for (key, value) in residualHeaders {
+      switch key.lowercased() {
+      case "user-agent":
+        media.addOption(":http-user-agent=\(value)")
+      case "referer", "referrer":
+        media.addOption(":http-referrer=\(value)")
+      default:
+        // libvlc 3.x silently ignores arbitrary headers; skip rather than
+        // pretending we forwarded them.
+        break
+      }
+    }
+
+    media.delegate = vlcDelegates
     self.media = media
     mediaPlayer.media = media
 
     if !hasFiredOnLoadStart {
       hasFiredOnLoadStart = true
-      let isNetworkSource = !url.isFileURL
+      // Classify by the *original* source URL, not the loopback rewrite —
+      // a proxied https origin is still a network source.
+      let isNetworkSource = !hybridSource.url.isFileURL
       _eventEmitter?.onLoadStart(
         onLoadStartData(
           sourceType: isNetworkSource ? .network : .local,
@@ -317,11 +449,56 @@ final class HybridVideoPlayer: HybridVideoPlayerSpec {
 
     status = .loading
     setBuffering(true)
+    hasEmittedEndForCurrentItem = false
   }
 
-  // MARK: - VLCMediaPlayerDelegate routing (via VLCDelegateProxy)
+  /// Rewrite an http(s) URL to point at the local auth proxy on
+  /// 127.0.0.1:<port> while preserving path + query so VLC's relative
+  /// segment resolution keeps targeting the proxy.
+  private func buildLocalProxyURL(from origin: URL, port: UInt16) -> URL? {
+    guard
+      var components = URLComponents(url: origin, resolvingAgainstBaseURL: false)
+    else { return nil }
+    components.scheme = "http"
+    components.host = "127.0.0.1"
+    components.port = Int(port)
+    components.user = nil
+    components.password = nil
+    return components.url
+  }
 
-  fileprivate func handleStateChange() {
+  private func applyHlsNetworkOptions(to media: VLCMedia) {
+    media.addOption(":network-caching=\(VLCHLSDefaults.networkCachingMs)")
+    media.addOption(":live-caching=\(VLCHLSDefaults.liveCachingMs)")
+    // HLS over HTTP benefits from reconnect; harmless for file URLs.
+    media.addOption(":http-reconnect=true")
+  }
+
+  /// Resets stall-watchdog liveness so a long seek / buffer gap is not mistaken for a dead stream.
+  private func markUserInitiatedTransport() {
+    lastProgressTickMonotonic = ProcessInfo.processInfo.systemUptime
+  }
+
+  private func applySeek(seconds target: Double) {
+    let ms = Int32(min(Double(Int32.max), max(0, target * 1000.0)))
+
+    if mediaPlayer.isSeekable {
+      mediaPlayer.time = VLCTime(int: ms)
+      pendingSeekSeconds = nil
+      return
+    }
+
+    let totalMs = Double(media?.length.intValue ?? 0)
+    if totalMs > 0 {
+      let position = Float(min(1.0, (Double(ms)) / totalMs))
+      mediaPlayer.position = position
+      pendingSeekSeconds = nil
+    } else {
+      pendingSeekSeconds = target
+    }
+  }
+
+  private func handleStateChange() {
     let state = mediaPlayer.state
     switch state {
     case .opening:
@@ -329,27 +506,33 @@ final class HybridVideoPlayer: HybridVideoPlayerSpec {
       setBuffering(true)
 
     case .buffering:
-      // VLC fires .buffering both at initial load and during playback when
-      // the buffer drains. If the player is already playing, treat as
-      // genuine buffering; if it isn't, treat as load-progress.
+      markUserInitiatedTransport()
       setBuffering(true)
-      status = .loading
+      if status != .readytoplay {
+        status = .loading
+      }
 
     case .playing:
       setBuffering(false)
       status = .readytoplay
       maybeFireOnLoad()
       flushPendingSeek()
+      reconnectAttempts = 0
+      VideoManager.shared.requestAudioSessionUpdate()
 
     case .paused:
       setBuffering(false)
-      // Keep status as readytoplay — we're loaded, just not advancing.
       if status == .loading { status = .readytoplay }
+      VideoManager.shared.requestAudioSessionUpdate()
 
     case .stopped, .ended:
       setBuffering(false)
-      _eventEmitter?.onEnd()
+      if !hasEmittedEndForCurrentItem {
+        hasEmittedEndForCurrentItem = true
+        _eventEmitter?.onEnd()
+      }
       if loop {
+        hasEmittedEndForCurrentItem = false
         currentTime = 0
         try? play()
       }
@@ -357,6 +540,7 @@ final class HybridVideoPlayer: HybridVideoPlayerSpec {
     case .error:
       setBuffering(false)
       status = .error
+      // JS layer maps `error` status → `onError` (see VideoPlayer.ts).
 
     default:
       break
@@ -365,23 +549,24 @@ final class HybridVideoPlayer: HybridVideoPlayerSpec {
     emitPlaybackState()
   }
 
-  fileprivate func handleTimeChange() {
+  private func handleTimeChange() {
     let cur = currentTime
     let dur = duration
+    if cur.isFinite {
+      lastProgressTimeSeconds = cur
+      lastProgressTickMonotonic = ProcessInfo.processInfo.systemUptime
+    }
+
     _eventEmitter?.onProgress(
       onProgressData(
-        currentTime: cur,
-        duration: dur,
-        // VLC's buffer position isn't exposed as a duration value; report 0.
+        currentTime: cur.isFinite ? cur : 0,
+        duration: dur.isFinite ? dur : Double.nan,
         bufferDuration: 0
       )
     )
-    // Once we have a non-zero duration, fulfill any deferred seeks.
     flushPendingSeek()
     maybeFireOnLoad()
   }
-
-  // MARK: - Helpers
 
   private func setBuffering(_ buffering: Bool) {
     isCurrentlyBuffering = buffering
@@ -402,20 +587,25 @@ final class HybridVideoPlayer: HybridVideoPlayerSpec {
   private func maybeFireOnLoad() {
     guard !hasFiredOnLoad else { return }
     let dur = duration
-    if dur <= 0 && !mediaPlayer.isPlaying {
-      // Not enough info yet — wait for a later tick.
+    let hasDuration = dur.isFinite && dur > 0
+    let size = mediaPlayer.videoSize
+    let hasVideo = size.width > 0 && size.height > 0
+    // VOD HLS from MediaMTX may keep length at 0 until the playlist is fully
+    // parsed; still emit onLoad once we are playing or have decoded dimensions
+    // so JS overlays (e.g. preroll spinner) can clear.
+    if !hasDuration && !mediaPlayer.isPlaying && !hasVideo {
       return
     }
     hasFiredOnLoad = true
-    let size = mediaPlayer.videoSize
     let width = Double(size.width)
     let height = Double(size.height)
     let orientation: VideoOrientation =
       height > width ? .portrait : (width > height ? .landscape : .square)
+    let ct = currentTime
     _eventEmitter?.onLoad(
       onLoadData(
-        currentTime: currentTime,
-        duration: dur,
+        currentTime: ct.isFinite ? ct : 0,
+        duration: dur.isFinite ? dur : Double.nan,
         height: height,
         width: width,
         orientation: orientation
@@ -426,30 +616,82 @@ final class HybridVideoPlayer: HybridVideoPlayerSpec {
 
   private func flushPendingSeek() {
     guard let target = pendingSeekSeconds else { return }
-    let totalMs = Double(mediaPlayer.media?.length.intValue ?? 0)
-    if totalMs > 0 {
-      let position = Float(min(1.0, (target * 1000.0) / totalMs))
-      mediaPlayer.position = position
-      pendingSeekSeconds = nil
+    applySeek(seconds: target)
+  }
+
+  // MARK: - Stall detection + reconnect
+
+  private func startStallWatchdogIfNeeded() {
+    invalidateStallWatchdog()
+    let timer = Timer.scheduledTimer(withTimeInterval: Self.stallCheckIntervalSeconds, repeats: true) {
+      [weak self] _ in
+      self?.evaluatePlaybackStall()
+    }
+    RunLoop.main.add(timer, forMode: .common)
+    stallCheckTimer = timer
+  }
+
+  private func invalidateStallWatchdog() {
+    stallCheckTimer?.invalidate()
+    stallCheckTimer = nil
+  }
+
+  private func evaluatePlaybackStall() {
+    guard media != nil else { return }
+    guard mediaPlayer.isPlaying else { return }
+    guard !isCurrentlyBuffering else { return }
+    guard status == .readytoplay else { return }
+
+    let now = ProcessInfo.processInfo.systemUptime
+    let idle = now - lastProgressTickMonotonic
+    guard idle > Self.stallNoProgressSeconds else { return }
+
+    // Genuine stall: VLC still claims "playing" but time is not advancing.
+    trySoftRecovery()
+  }
+
+  private func trySoftRecovery() {
+    let savedTime = lastProgressTimeSeconds
+
+    mediaPlayer.pause()
+    mediaPlayer.play()
+
+    DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
+      guard let self else { return }
+      guard self.mediaPlayer.isPlaying else { return }
+      let progressed =
+        abs(self.lastProgressTimeSeconds - savedTime) > 0.25
+      if !progressed {
+        self.performAutoReconnect(resumeNear: savedTime)
+      } else {
+        self.reconnectAttempts = 0
+      }
     }
   }
-}
 
-/// NSObject proxy bridging VLCMediaPlayerDelegate (Obj-C protocol) to the
-/// Swift-only HybridVideoPlayer. HybridVideoPlayer cannot conform directly
-/// because its base class chain isn't guaranteed to inherit from NSObject.
-final class VLCDelegateProxy: NSObject, VLCMediaPlayerDelegate {
-  private weak var owner: HybridVideoPlayer?
+  private func performAutoReconnect(resumeNear seconds: Double) {
+    guard reconnectAttempts < Self.maxAutoReconnects else { return }
+    reconnectAttempts += 1
+    markUserInitiatedTransport()
 
-  init(owner: HybridVideoPlayer) {
-    self.owner = owner
+    let resume = max(0, seconds)
+    guard let hybridSource = source as? HybridVideoPlayerSource else { return }
+
+    mediaPlayer.stop()
+    media?.delegate = nil
+    media = nil
+    mediaPlayer.media = nil
+
+    hasFiredOnLoad = false
+    hasEmittedEndForCurrentItem = false
+
+    attachMedia()
+    mediaPlayer.play()
+
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
+      guard let self else { return }
+      self.currentTime = resume
+    }
   }
 
-  func mediaPlayerStateChanged(_ aNotification: Notification) {
-    owner?.handleStateChange()
-  }
-
-  func mediaPlayerTimeChanged(_ aNotification: Notification) {
-    owner?.handleTimeChange()
-  }
 }

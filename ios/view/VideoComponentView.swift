@@ -114,6 +114,9 @@ import UIKit
       guard let self = self else { return }
       hybridPlayer.mediaPlayer.drawable = self.drawableView
       self.applyResizeMode()
+      // `play()` may have run from JS before this view existed; VLC needs a
+      // drawable to complete HLS decode on iOS — kick playback again here.
+      hybridPlayer.notifyVideoHostViewAttached()
     }
   }
 

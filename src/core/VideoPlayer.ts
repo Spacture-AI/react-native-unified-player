@@ -13,6 +13,7 @@ import {
 } from './types/VideoError';
 import type { VideoPlayerBase } from './types/VideoPlayerBase';
 import type { VideoPlayerStatus } from './types/VideoPlayerStatus';
+import type { ListenerSubscription } from '../spec/nitro/VideoPlayerEventEmitter.nitro';
 import { createPlayer } from './utils/playerFactory';
 import { createSource } from './utils/sourceFactory';
 import { VideoPlayerEvents } from './VideoPlayerEvents';
@@ -20,6 +21,8 @@ import { VideoPlayerEvents } from './VideoPlayerEvents';
 class VideoPlayer extends VideoPlayerEvents implements VideoPlayerBase {
   private _player: VideoPlayerImpl | undefined;
   private _releaseTimeout: ReturnType<typeof setTimeout> | undefined;
+  private _statusErrorSubscription: ListenerSubscription | undefined;
+  private _lastObservedStatus: VideoPlayerStatus | undefined;
 
   protected get player(): VideoPlayerImpl {
     if (this._player === undefined) {
@@ -39,6 +42,20 @@ class VideoPlayer extends VideoPlayerEvents implements VideoPlayerBase {
     // Initialize events
     super(player.eventEmitter);
     this._player = player;
+    this._lastObservedStatus = player.status;
+    this._statusErrorSubscription =
+      player.eventEmitter.addOnStatusChangeListener((status) => {
+        if (status === 'error' && this._lastObservedStatus !== 'error') {
+          this.triggerJSEvent(
+            'onError',
+            new VideoRuntimeError(
+              'unknown/unknown',
+              'Playback failed (native player reported error status).'
+            )
+          );
+        }
+        this._lastObservedStatus = status;
+      });
   }
 
   /**
@@ -47,6 +64,10 @@ class VideoPlayer extends VideoPlayerEvents implements VideoPlayerBase {
    */
   __destroy() {
     if (this._player === undefined) return;
+
+    this._statusErrorSubscription?.remove();
+    this._statusErrorSubscription = undefined;
+    this._lastObservedStatus = undefined;
 
     this.clearAllEvents();
 
