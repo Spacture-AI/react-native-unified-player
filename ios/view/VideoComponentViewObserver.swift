@@ -2,12 +2,13 @@
 //  VideoComponentViewObserver.swift
 //  ReactNativeVideo
 //
-//  Created by Krzysztof Moch on 06/05/2025.
+//  VLC backend rewrite — AVPlayerViewController is gone, so the observer
+//  collapses into a thin delegate proxy that just forwards lifecycle hooks
+//  the JS layer expects (PiP/fullscreen become inert under VLC).
 //
 
 import Foundation
-import AVKit
-import AVFoundation
+import UIKit
 
 protocol VideoComponentViewDelegate: AnyObject {
   func onPictureInPictureChange(_ isActive: Bool)
@@ -19,130 +20,29 @@ protocol VideoComponentViewDelegate: AnyObject {
   func onReadyToDisplay()
 }
 
-// Map delegate methods to view manager methods
 final class VideoViewDelegate: NSObject, VideoComponentViewDelegate {
   weak var viewManager: HybridVideoViewViewManager?
-  
+
   init(viewManager: HybridVideoViewViewManager) {
     self.viewManager = viewManager
   }
-  
+
   func onPictureInPictureChange(_ isActive: Bool) {
     viewManager?.onPictureInPictureChange(isActive)
   }
-  
+
   func onFullscreenChange(_ isActive: Bool) {
     viewManager?.onFullscreenChange(isActive)
   }
-  
-  func willEnterFullscreen() {
-    viewManager?.willEnterFullscreen()
-  }
-  
-  func willExitFullscreen() {
-    viewManager?.willExitFullscreen()
-  }
-  
-  func willEnterPictureInPicture() {
-    viewManager?.willEnterPictureInPicture()
-  }
-  
-  func willExitPictureInPicture() {
-    viewManager?.willExitPictureInPicture()
-  }
-  
+
+  func willEnterFullscreen() { viewManager?.willEnterFullscreen() }
+  func willExitFullscreen() { viewManager?.willExitFullscreen() }
+  func willEnterPictureInPicture() { viewManager?.willEnterPictureInPicture() }
+  func willExitPictureInPicture() { viewManager?.willExitPictureInPicture() }
+
   func onReadyToDisplay() {
     if let player = viewManager?.player as? HybridVideoPlayer {
       player._eventEmitter?.onReadyToDisplay()
-    }
-  }
-}
-
-class VideoComponentViewObserver: NSObject, AVPlayerViewControllerDelegate {
-  private weak var view: VideoComponentView?
-  
-  var delegate: VideoViewDelegate? {
-    get {
-      return view?.delegate
-    }
-  }
-  
-  var playerViewController: AVPlayerViewController? {
-    return view?.playerViewController
-  }
-  
-  // playerViewController observers
-  var onReadyToDisplayObserver: NSKeyValueObservation?
-  
-  init(view: VideoComponentView) {
-    self.view = view
-    super.init()
-  }
-  
-  func initializePlayerViewContorollerObservers() {
-    guard let playerViewController = playerViewController else {
-      return
-    }
-    
-    onReadyToDisplayObserver = playerViewController.observe(\.isReadyForDisplay, options: [.new]) { [weak self] _, change in
-      guard let self = self else { return }
-      if change.newValue == true {
-        self.delegate?.onReadyToDisplay()
-      }
-    }
-  }
-  
-  func removePlayerViewControllerObservers() {
-    onReadyToDisplayObserver?.invalidate()
-    onReadyToDisplayObserver = nil
-  }
-  
-  func updatePlayerViewControllerObservers() {
-    removePlayerViewControllerObservers()
-    initializePlayerViewContorollerObservers()
-  }
-  
-  func playerViewControllerDidStartPictureInPicture(_: AVPlayerViewController) {
-    delegate?.onPictureInPictureChange(true)
-  }
-  
-  func playerViewControllerDidStopPictureInPicture(_: AVPlayerViewController) {
-    delegate?.onPictureInPictureChange(false)
-  }
-  
-  func playerViewControllerWillStartPictureInPicture(_: AVPlayerViewController) {
-    delegate?.willEnterPictureInPicture()
-  }
-  
-  func playerViewControllerWillStopPictureInPicture(_: AVPlayerViewController) {
-    delegate?.willExitPictureInPicture()
-  }
-  
-  func playerViewController(
-    _: AVPlayerViewController,
-    willEndFullScreenPresentationWithAnimationCoordinator coordinator: UIViewControllerTransitionCoordinator
-  ) {
-    delegate?.willExitFullscreen()
-
-    coordinator.animate(alongsideTransition: nil) { [weak self] _ in
-      guard let self = self else { return }
-      // Restore user's controls setting when exiting fullscreen
-      self.view?.onExitFullscreen()
-      self.delegate?.onFullscreenChange(false)
-    }
-  }
-
-  func playerViewController(
-    _: AVPlayerViewController,
-    willBeginFullScreenPresentationWithAnimationCoordinator coordinator: UIViewControllerTransitionCoordinator
-  ) {
-    delegate?.willEnterFullscreen()
-    // Enable controls overlay when entering fullscreen
-    view?.onEnterFullscreen()
-
-    coordinator.animate(alongsideTransition: nil) { [weak self] _ in
-      guard let self = self else { return }
-      self.delegate?.onFullscreenChange(true)
     }
   }
 }
