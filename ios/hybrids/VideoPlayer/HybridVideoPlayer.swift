@@ -60,6 +60,26 @@ final class HybridVideoPlayer: HybridVideoPlayerSpec, VLCPlaybackDelegateOwner {
   /// from `VideoComponentView` when the surface attaches.
   private var wantsPlaybackWhenDrawableReady: Bool = false
 
+  /// Marshal a closure onto the main thread, executing inline if we're
+  /// already there. VLC's renderer (`VLCOpenGLES2VideoView`) reaches into
+  /// `CAEAGLLayer` to manage its OpenGL renderbuffer when the active
+  /// media changes (`mediaPlayer.media = ...`), the player stops, or the
+  /// drawable is reattached. Those CALayer mutations must happen on the
+  /// main thread; otherwise iOS raises
+  /// `_raiseExceptionForBackgroundThreadLayerPropertyModification`.
+  /// JS-driven lifecycle calls (release / replaceSourceAsync /
+  /// constructor) can land on Nitro's worker thread, so we must hop
+  /// before touching any `mediaPlayer.*` setter that triggers a render
+  /// reset.
+  @inline(__always)
+  private static func runOnMain(_ block: @escaping () -> Void) {
+    if Thread.isMainThread {
+      block()
+    } else {
+      DispatchQueue.main.async(execute: block)
+    }
+  }
+
   init(source: (any HybridVideoPlayerSourceSpec)) throws {
     self.source = source
     self.eventEmitter = HybridVideoPlayerEventEmitter()
@@ -200,16 +220,19 @@ final class HybridVideoPlayer: HybridVideoPlayerSpec, VLCPlaybackDelegateOwner {
 
   func release() {
     invalidateStallWatchdog()
-    if mediaPlayer.isPlaying {
-      mediaPlayer.stop()
-    }
-    media?.delegate = nil
-    media = nil
-    mediaPlayer.media = nil
-    mediaPlayer.delegate = nil
-    vlcDelegates = nil
 
-    authProxy?.stop()
+    // Capture the VLC objects so they survive past `self` being
+    // deallocated — `release()` may be called from `deinit` on a
+    // background thread, and the closure below has to outlive the
+    // `HybridVideoPlayer` instance.
+    let mp = mediaPlayer
+    let m = media
+    let proxy = authProxy
+
+    // Clear JS-side bookkeeping first; it doesn't touch any UIKit
+    // layer state and can safely run on whatever thread we're on.
+    media = nil
+    vlcDelegates = nil
     authProxy = nil
 
     try? _eventEmitter?.clearAllListeners()
@@ -223,6 +246,21 @@ final class HybridVideoPlayer: HybridVideoPlayerSpec, VLCPlaybackDelegateOwner {
     reconnectAttempts = 0
     lastProgressTimeSeconds = 0
     lastProgressTickMonotonic = 0
+
+    // Tear down VLC on the main thread. `mp.stop()` and
+    // `mp.media = nil` cause `VLCOpenGLES2VideoView` to reset its
+    // OpenGL renderbuffer, which mutates `CAEAGLLayer.contents` —
+    // strictly main-thread-only. Without this hop, iOS raises
+    // `_raiseExceptionForBackgroundThreadLayerPropertyModification`
+    // whenever a player is released from a non-main queue (typical
+    // when the JS owner is dropped from a Nitro worker thread).
+    Self.runOnMain {
+      if mp.isPlaying { mp.stop() }
+      m?.delegate = nil
+      mp.media = nil
+      mp.delegate = nil
+      proxy?.stop()
+    }
 
     VideoManager.shared.unregister(player: self)
   }
@@ -238,16 +276,24 @@ final class HybridVideoPlayer: HybridVideoPlayerSpec, VLCPlaybackDelegateOwner {
 
   func play() throws {
     wantsPlaybackWhenDrawableReady = true
-    mediaPlayer.play()
+    let mp = mediaPlayer
+    Self.runOnMain { mp.play() }
     VideoManager.shared.requestAudioSessionUpdate()
   }
 
   func pause() throws {
     wantsPlaybackWhenDrawableReady = false
-    if mediaPlayer.canPause {
-      mediaPlayer.pause()
-    } else {
-      mediaPlayer.stop()
+    let mp = mediaPlayer
+    // VLC's `stop()` (the not-canPause fallback) tears down the
+    // renderbuffer; must be on main. Even `pause()` proper sometimes
+    // touches the GL view on first call after attach, so keep both
+    // branches on main for symmetry.
+    Self.runOnMain {
+      if mp.canPause {
+        mp.pause()
+      } else {
+        mp.stop()
+      }
     }
     VideoManager.shared.requestAudioSessionUpdate()
   }
@@ -294,14 +340,20 @@ final class HybridVideoPlayer: HybridVideoPlayerSpec, VLCPlaybackDelegateOwner {
     case .second(let newSource):
       wantsPlaybackWhenDrawableReady = false
       invalidateStallWatchdog()
-      if mediaPlayer.isPlaying {
-        mediaPlayer.stop()
-      }
-      media?.delegate = nil
-      media = nil
-      mediaPlayer.media = nil
 
-      authProxy?.stop()
+      // Tear down the previous VLC media on main — same reasoning as
+      // `release()`. `mediaPlayer.stop()` and `mediaPlayer.media = nil`
+      // both poke `VLCOpenGLES2VideoView`'s renderbuffer.
+      let mp = mediaPlayer
+      let oldMedia = media
+      let oldProxy = authProxy
+      Self.runOnMain {
+        if mp.isPlaying { mp.stop() }
+        oldMedia?.delegate = nil
+        mp.media = nil
+        oldProxy?.stop()
+      }
+      media = nil
       authProxy = nil
 
       self.source = newSource
@@ -432,7 +484,17 @@ final class HybridVideoPlayer: HybridVideoPlayerSpec, VLCPlaybackDelegateOwner {
 
     media.delegate = vlcDelegates
     self.media = media
-    mediaPlayer.media = media
+    // Assigning `mediaPlayer.media` causes VLC to swap the active
+    // `VLCOpenGLES2VideoView` renderbuffer, which mutates
+    // `CAEAGLLayer.contents`. Hop to main so the layer write is on
+    // the main thread. We capture `mediaPlayer` and the new `media`
+    // by value so the assignment is safe even if `self` is dropped
+    // before the dispatched block runs.
+    let mp = mediaPlayer
+    let mediaToAttach = media
+    Self.runOnMain {
+      mp.media = mediaToAttach
+    }
 
     if !hasFiredOnLoadStart {
       hasFiredOnLoadStart = true
@@ -482,17 +544,26 @@ final class HybridVideoPlayer: HybridVideoPlayerSpec, VLCPlaybackDelegateOwner {
   private func applySeek(seconds target: Double) {
     let ms = Int32(min(Double(Int32.max), max(0, target * 1000.0)))
 
-    if mediaPlayer.isSeekable {
-      mediaPlayer.time = VLCTime(int: ms)
+    // VLC's seek can prompt the demuxer to re-attach segments and
+    // refresh the renderbuffer (especially for HLS where a seek
+    // jumps to a different .ts segment). Marshal onto main so any
+    // resulting CALayer write happens there. We capture the player
+    // by value so the dispatch is safe even if the JS owner is
+    // released before the block fires.
+    let mp = mediaPlayer
+    let totalMs = Double(media?.length.intValue ?? 0)
+    let isSeekable = mediaPlayer.isSeekable
+
+    if isSeekable {
       pendingSeekSeconds = nil
+      Self.runOnMain { mp.time = VLCTime(int: ms) }
       return
     }
 
-    let totalMs = Double(media?.length.intValue ?? 0)
     if totalMs > 0 {
       let position = Float(min(1.0, (Double(ms)) / totalMs))
-      mediaPlayer.position = position
       pendingSeekSeconds = nil
+      Self.runOnMain { mp.position = position }
     } else {
       pendingSeekSeconds = target
     }
