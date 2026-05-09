@@ -85,3 +85,7 @@ android/generated
 # React Native Nitro Modules
 # nitrogen/ is NOT ignored - it must be committed for npm publishing
 .qodo
+
+# sbuild artifacts
+.pkg-build/
+package.json.bak
